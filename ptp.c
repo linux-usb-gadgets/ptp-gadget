@@ -2455,7 +2455,7 @@ static int enum_objects(const char *path)
 
 		dot = strrchr(dentry->d_name, '.');
 
-		if (!dot || dot == dentry->d_name)
+		if (!dot || dot == dentry->d_name || !strncmp(dentry->d_name, "..", 2))
 			continue;
 
 		/* TODO: use identify from ImageMagick and parse its output */
