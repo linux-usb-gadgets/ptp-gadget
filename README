@@ -7,12 +7,8 @@ This is an open-source project, licensed under GPL v3, hence the author is
 hoping, that it will be useful to others, and that others will contribute to it,
 eventually making it a complete implementation of the standard.
 
-The driver works completely in user-space and uses gadgetfs to communicate with
+The driver works completely in user-space and uses functionfs to communicate with
 USB gadget hardware.
-
-The code is based on the gadgetfs examples from
-http://www.linux-usb.org/gadget/usb.c and uses unchanged
-http://www.linux-usb.org/gadget/usbstring.[ch].
 
 As of v0.2 only the minimal compulsory set of PTP requests, as specified in the
 standard, is supported. Supported are downloading of images and generation of

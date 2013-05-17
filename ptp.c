@@ -32,10 +32,13 @@
 #include <asm/byteorder.h>
 
 #include <linux/types.h>
-#include <linux/usb/gadgetfs.h>
+#include <linux/usb/functionfs.h>
 #include <linux/usb/ch9.h>
 
-#include "usbstring.h"
+#define cpu_to_le16(x)	htole16(x)
+#define cpu_to_le32(x)	htole32(x)
+#define le32_to_cpu(x)	le32toh(x)
+#define le16_to_cpu(x)	le16toh(x)
 
 #define min(a,b) ({ typeof(a) __a = (a); typeof(b) __b = (b); __a < __b ? __a : __b; })
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -50,14 +53,11 @@ static int verbose;
 
 #define DRIVER_VENDOR_NUM	0x1d6b
 #define DRIVER_PRODUCT_NUM	0x0100
-#define DRIVER_MFGR		"Linux"
-#define DRIVER_PRODUCT		"PTP Gadget"
-#define DRIVER_CONFIG		"Configuration 0"
-#define DRIVER_INTERFACE	"Source/Sink"
+#define DRIVER_INTERFACE	"PTP Interface"
 
 /* Will be used for bcdDevice: remember to update on major changes */
 #define MAJOR			1
-#define MINOR			0
+#define MINOR			1
 #define DRIVER_VERSION		((MAJOR << 8) | MINOR)
 #define VERSION_STRING		__stringify(MAJOR) "." __stringify(MINOR)
 
@@ -68,158 +68,108 @@ static int verbose;
 
 /*-------------------------------------------------------------------------*/
 
-/* these descriptors are modified based on what controller we find */
-
-#define	STRINGID_MFGR		1
-#define	STRINGID_PRODUCT	2
-#define	STRINGID_CONFIG		3
-#define	STRINGID_INTERFACE	4
-
-static struct usb_device_descriptor device_desc = {
-	.bLength =		sizeof device_desc,
-	.bDescriptorType =	USB_DT_DEVICE,
-
-	.bcdUSB =		__constant_cpu_to_le16(0x0200),
-	.bcdDevice =		__constant_cpu_to_le16(DRIVER_VERSION),
-	.bDeviceClass =		USB_CLASS_PER_INTERFACE,
-	.bDeviceSubClass =	0,
-	.bDeviceProtocol =	0,
-	/* .bMaxPacketSize0 ... set by gadgetfs */
-	.idVendor =		__constant_cpu_to_le16(DRIVER_VENDOR_NUM),
-	.idProduct =		__constant_cpu_to_le16(DRIVER_PRODUCT_NUM),
-	.iManufacturer =	STRINGID_MFGR,
-	.iProduct =		STRINGID_PRODUCT,
-	.bNumConfigurations =	1,
-};
-
-#define	MAX_USB_POWER		1
-
-#define	CONFIG_VALUE		1
-
-static const struct usb_config_descriptor config = {
-	.bLength =		sizeof config,
-	.bDescriptorType =	USB_DT_CONFIG,
-
-	/* must compute wTotalLength ... */
-	.bNumInterfaces =	1,
-	.bConfigurationValue =	CONFIG_VALUE,
-	.iConfiguration =	STRINGID_CONFIG,
-	.bmAttributes =		USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER,
-	.bMaxPower =		(MAX_USB_POWER + 1) / 2,
-};
-
 /* USB subclass value = the protocol encapsulation */
 #define USB_SC_IMAGE_CAPTURE	0x01		/* Still Image Capture Subclass */
 #define USB_PR_CB		0x01		/* Control/Bulk w/o interrupt */
 
-static struct usb_interface_descriptor source_sink_intf = {
-	.bLength =		sizeof source_sink_intf,
-	.bDescriptorType =	USB_DT_INTERFACE,
-
-	.bInterfaceClass =	USB_CLASS_STILL_IMAGE,
-	.bInterfaceSubClass =	USB_SC_IMAGE_CAPTURE,
-	.bInterfaceProtocol =	USB_PR_CB,
-	.iInterface =		STRINGID_INTERFACE,
-};
-
-#define MAX_PACKET_SIZE_FS 64
 #define MAX_PACKET_SIZE_HS 512
-
-/* Full speed configurations are used for full-speed only devices as
- * well as dual-speed ones (the only kind with high speed support).
- */
-static struct usb_endpoint_descriptor fs_source_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	/* NOTE some controllers may need FS bulk max packet size
-	 * to be smaller.  it would be a chip-specific option.
-	 */
-	.wMaxPacketSize =	__constant_cpu_to_le16(MAX_PACKET_SIZE_FS),
-};
-
-static struct usb_endpoint_descriptor fs_sink_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	__constant_cpu_to_le16(MAX_PACKET_SIZE_FS),
-};
 
 /* some devices can handle other status packet sizes */
 #define STATUS_MAXPACKET	8
-//#define	LOG2_STATUS_POLL_MSEC	3
 
-static struct usb_endpoint_descriptor fs_status_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_INT,
-	.wMaxPacketSize =	__constant_cpu_to_le16(STATUS_MAXPACKET),
-//	.bInterval =		(1 << LOG2_STATUS_POLL_MSEC),
-	.bInterval =		10,
-};
-
-static const struct usb_endpoint_descriptor *fs_eps[] = {
-	&fs_source_desc,
-	&fs_sink_desc,
-	&fs_status_desc,
-};
-
-
-/* High speed configurations are used only in addition to a full-speed
- * ones ... since all high speed devices support full speed configs.
- * Of course, not all hardware supports high speed configurations.
- */
-
-static struct usb_endpoint_descriptor hs_source_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	__constant_cpu_to_le16(MAX_PACKET_SIZE_HS),
-};
-
-static struct usb_endpoint_descriptor hs_sink_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	__constant_cpu_to_le16(MAX_PACKET_SIZE_HS),
-};
-
-static struct usb_endpoint_descriptor hs_status_desc = {
-	.bLength =		USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType =	USB_DT_ENDPOINT,
-
-	.bmAttributes =		USB_ENDPOINT_XFER_INT,
-	.wMaxPacketSize =	__constant_cpu_to_le16(STATUS_MAXPACKET),
-//	.bInterval =		LOG2_STATUS_POLL_MSEC + 3,
-	.bInterval =		10,
-};
-
-static const struct usb_endpoint_descriptor *hs_eps[] = {
-	&hs_source_desc,
-	&hs_sink_desc,
-	&hs_status_desc,
+static const struct
+{
+	struct usb_functionfs_descs_head header;
+	struct {
+		struct usb_interface_descriptor intf;
+		struct usb_endpoint_descriptor_no_audio source;
+		struct usb_endpoint_descriptor_no_audio sink;
+		struct usb_endpoint_descriptor_no_audio status;
+	} __attribute__((packed)) fs_descs, hs_descs;
+} __attribute__((packed)) descriptors = {
+	.header = {
+		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC),
+		.length = cpu_to_le32(sizeof(descriptors)),
+		.fs_count = 4,
+		.hs_count = 4,
+	}, .fs_descs = {
+		.intf = {
+			.bLength		= sizeof(descriptors.fs_descs.intf),
+			.bDescriptorType	= USB_DT_INTERFACE,
+			.bNumEndpoints		= 3,
+			.bInterfaceClass	= USB_CLASS_STILL_IMAGE,
+			.bInterfaceSubClass	= USB_SC_IMAGE_CAPTURE,
+			.bInterfaceProtocol	= USB_PR_CB,
+			.iInterface		= 1,
+		}, .source = {
+			.bLength		= sizeof(descriptors.fs_descs.source),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 1 | USB_DIR_IN,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+		}, .sink = {
+			.bLength		= sizeof(descriptors.fs_descs.sink),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 2 | USB_DIR_OUT,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+		}, .status = {
+			.bLength		= sizeof(descriptors.fs_descs.status),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bmAttributes		= USB_ENDPOINT_XFER_INT,
+			.bEndpointAddress	= 3 | USB_DIR_IN,
+			.wMaxPacketSize		= __constant_cpu_to_le16(STATUS_MAXPACKET),
+			.bInterval		= 10,
+		},
+	}, .hs_descs = {
+		.intf = {
+			.bLength		= sizeof(descriptors.hs_descs.intf),
+			.bDescriptorType	= USB_DT_INTERFACE,
+			.bNumEndpoints		= 3,
+			.bInterfaceClass	= USB_CLASS_STILL_IMAGE,
+			.bInterfaceSubClass	= USB_SC_IMAGE_CAPTURE,
+			.bInterfaceProtocol	= USB_PR_CB,
+			.iInterface		= 1,
+		}, .source = {
+			.bLength		= sizeof(descriptors.hs_descs.source),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 1 | USB_DIR_IN,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+			.wMaxPacketSize		= __constant_cpu_to_le16(MAX_PACKET_SIZE_HS),
+		}, .sink = {
+			.bLength		= sizeof(descriptors.hs_descs.sink),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 2 | USB_DIR_OUT,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+			.wMaxPacketSize		= __constant_cpu_to_le16(MAX_PACKET_SIZE_HS),
+		}, .status = {
+			.bLength		= sizeof(descriptors.hs_descs.status),
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 3 | USB_DIR_IN,
+			.bmAttributes		= USB_ENDPOINT_XFER_INT,
+			.wMaxPacketSize		= __constant_cpu_to_le16(STATUS_MAXPACKET),
+			.bInterval		= 10,
+		},
+	},
 };
 
 /*-------------------------------------------------------------------------*/
 
-
-static char driver_mfgr[64];
-
-static struct usb_string stringtab[] = {
-	{ STRINGID_MFGR,	driver_mfgr, },
-	{ STRINGID_PRODUCT,	DRIVER_PRODUCT, },
-	{ STRINGID_CONFIG,	DRIVER_CONFIG, },
-	{ STRINGID_INTERFACE,	DRIVER_INTERFACE, },
-};
-
-static struct usb_gadget_strings strings = {
-	.language =	0x0409,		/* "en-us" */
-	.strings =	stringtab,
+static const struct
+{
+	struct usb_functionfs_strings_head header;
+	struct {
+		__le16 code;
+		const char str1[sizeof(DRIVER_INTERFACE)];
+	} __attribute__((packed)) lang0;
+} __attribute__((packed)) strings = {
+	.header = {
+		.magic = cpu_to_le32(FUNCTIONFS_STRINGS_MAGIC),
+		.length = cpu_to_le32(sizeof(strings)),
+		.str_count = cpu_to_le32(1),
+		.lang_count = cpu_to_le32(1),
+	}, .lang0 = {
+		cpu_to_le16(0x0409), /* en-us */
+		DRIVER_INTERFACE,
+	},
 };
 
 /*-------------------------------------------------------------------------*/
@@ -228,16 +178,16 @@ static struct usb_gadget_strings strings = {
  * they were willing to waste the relevant code/data space.
  */
 
-static int	HIGHSPEED;
-static char	*DEVNAME;
-static char	*EP_IN_NAME, *EP_OUT_NAME, *EP_STATUS_NAME;
+#define FFS_PREFIX	"/dev/ptp/"
+#define FFS_PTP_EP0	FFS_PREFIX"ep0"
+#define FFS_PTP_IN	FFS_PREFIX"ep1"
+#define FFS_PTP_OUT	FFS_PREFIX"ep2"
+#define FFS_PTP_INT	FFS_PREFIX"ep3"
 
 /* gadgetfs currently has no chunking (or O_DIRECT/zerocopy) support
  * to turn big requests into lots of smaller ones; so this is "small".
  */
 #define	USB_BUFSIZE	(7 * 1024)
-
-static enum usb_device_speed current_speed;
 
 #define CHECK_COUNT(cnt, min, max, op) do {			\
 	if (cnt & 3 || cnt < min || cnt > max) {		\
@@ -587,349 +537,6 @@ static int object_handle_valid(unsigned int h)
 			return 1;
 
 	return 0;
-}
-
-static int autoconfig(void)
-{
-	struct stat	statb;
-	struct utsname	uts;
-	int ret;
-
-	/* NetChip 2280 PCI device or dummy_hcd, high/full speed */
-	if (stat(DEVNAME = "net2280", &statb) == 0 ||
-			stat(DEVNAME = "dummy_udc", &statb) == 0) {
-		HIGHSPEED = 1;
-
-		fs_source_desc.bEndpointAddress
-			= hs_source_desc.bEndpointAddress
-			= USB_DIR_IN | 7;
-		EP_IN_NAME = "ep-a";
-		fs_sink_desc.bEndpointAddress = hs_sink_desc.bEndpointAddress
-			= USB_DIR_OUT | 3;
-		EP_OUT_NAME = "ep-b";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress
-			= hs_status_desc.bEndpointAddress
-			= USB_DIR_IN | 11;
-		EP_STATUS_NAME = "ep-f";
-
-	/* Intel PXA 2xx processor, full speed only */
-	} else if (stat(DEVNAME = "pxa2xx_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 6;
-		EP_IN_NAME = "ep6in-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 7;
-		EP_OUT_NAME = "ep7out-bulk";
-
-		/* using bulk for this since the pxa interrupt endpoints
-		 * always use the no-toggle scheme (discouraged).
-		 */
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 11;
-		EP_STATUS_NAME = "ep11in-bulk";
-#if 0
-	/* AMD au1x00 processor, full speed only */
-	} else if (stat(DEVNAME = "au1x00_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 2;
-		EP_IN_NAME = "ep2in";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 4;
-		EP_OUT_NAME = "ep4out";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in";
-
-	/* Intel SA-1100 processor, full speed only */
-	} else if (stat(DEVNAME = "sa1100", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 2;
-		EP_IN_NAME = "ep2in-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1out-bulk";
-
-		source_sink_intf.bNumEndpoints = 2;
-		EP_STATUS_NAME = 0;
-#endif
-
-	/* Toshiba TC86c001 PCI device, full speed only */
-	} else if (stat(DEVNAME = "goku_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 2;
-		EP_IN_NAME = "ep2-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1-bulk";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3-bulk";
-
-	/* Renesas SH77xx processors, full speed only */
-	} else if (stat(DEVNAME = "sh_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 2;
-		EP_IN_NAME = "ep2in-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1out-bulk";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in-bulk";
-
-	/* OMAP 1610 and newer devices, full speed only, fifo mode 0 or 3 */
-	} else if (stat(DEVNAME = "omap_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 2;
-		EP_OUT_NAME = "ep2out-bulk";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in-int";
-
-	/* Something based on Mentor USB Highspeed Dual-Role Controller */
-	} else if (stat(DEVNAME = "musb_hdrc", &statb) == 0) {
-		HIGHSPEED = 1;
-
-		fs_source_desc.bEndpointAddress
-			= hs_source_desc.bEndpointAddress
-			= USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in";
-		fs_sink_desc.bEndpointAddress = hs_sink_desc.bEndpointAddress
-			= USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1out";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress
-			= hs_status_desc.bEndpointAddress
-			= USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in";
-
-	/* Atmel AT91 processors, full speed only */
-	} else if (stat(DEVNAME = "at91_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 2;
-		EP_OUT_NAME = "ep2";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3-int";
-
-	/* Sharp LH740x processors, full speed only */
-	} else if (stat(DEVNAME = "lh740x_udc", &statb) == 0) {
-		HIGHSPEED = 0;
-
-		fs_source_desc.bEndpointAddress = USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in-bulk";
-		fs_sink_desc.bEndpointAddress = USB_DIR_OUT | 2;
-		EP_OUT_NAME = "ep2out-bulk";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress = USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in-int";
-
-	/* Atmel AT32AP700x processors, high/full speed */
-	} else if (stat(DEVNAME = "atmel_usba_udc", &statb) == 0) {
-		HIGHSPEED = 1;
-
-		fs_source_desc.bEndpointAddress
-			= hs_source_desc.bEndpointAddress
-			= USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in-bulk";
-		fs_sink_desc.bEndpointAddress
-			= hs_sink_desc.bEndpointAddress
-			= USB_DIR_OUT | 2;
-		EP_OUT_NAME = "ep2out-bulk";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress
-			= hs_status_desc.bEndpointAddress
-			= USB_DIR_IN | 3;
-		EP_STATUS_NAME = "ep3in-int";
-
-	/* Freescale i.MX31 SoC, high/full speed */
-	} else if (stat(DEVNAME = "fsl-usb2-udc", &statb) == 0) {
-		HIGHSPEED = 1;
-
-		fs_source_desc.bEndpointAddress
-			= hs_source_desc.bEndpointAddress
-			= USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in";
-		fs_sink_desc.bEndpointAddress
-			= hs_sink_desc.bEndpointAddress
-			= USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1out";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress
-			= hs_status_desc.bEndpointAddress
-			= USB_DIR_IN | 2;
-		EP_STATUS_NAME = "ep2in";
-	} else if (stat(DEVNAME = "arc_udc", &statb) == 0) {
-		HIGHSPEED = 1;
-
-		fs_source_desc.bEndpointAddress
-			= hs_source_desc.bEndpointAddress
-			= USB_DIR_IN | 1;
-		EP_IN_NAME = "ep1in";
-		fs_sink_desc.bEndpointAddress
-			= hs_sink_desc.bEndpointAddress
-			= USB_DIR_OUT | 1;
-		EP_OUT_NAME = "ep1out";
-
-		source_sink_intf.bNumEndpoints = 3;
-		fs_status_desc.bEndpointAddress
-			= hs_status_desc.bEndpointAddress
-			= USB_DIR_IN | 2;
-		EP_STATUS_NAME = "ep2in";
-	} else {
-		DEVNAME = 0;
-		return -ENODEV;
-	}
-
-	ret = uname(&uts);
-	snprintf(driver_mfgr, sizeof(driver_mfgr), DRIVER_MFGR " %s with %s",
-		 ret ? "unknown" : uts.release, DEVNAME);
-
-	return 0;
-}
-
-/*-------------------------------------------------------------------------*/
-
-/* you should be able to open and configure endpoints
- * whether or not the host is connected
- */
-static int ep_config(char *name,
-		     struct usb_endpoint_descriptor *fs,
-		     struct usb_endpoint_descriptor *hs)
-{
-	int	fd, err;
-	char	buf[USB_BUFSIZE];
-
-	/* open and initialize with endpoint descriptor(s) */
-	fd = open(name, O_RDWR);
-	if (fd < 0) {
-		err = -errno;
-		fprintf(stderr, "open %s error %d (%s)\n",
-			name, errno, strerror(errno));
-		return err;
-	}
-
-	/* one (fs or ls) or two (fs + hs) sets of config descriptors */
-	*(uint32_t *)buf = 1;	/* tag for this format */
-	memcpy(buf + 4, fs, USB_DT_ENDPOINT_SIZE);
-	if (HIGHSPEED)
-		memcpy(buf + 4 + USB_DT_ENDPOINT_SIZE,
-			hs, USB_DT_ENDPOINT_SIZE);
-	err = write(fd, buf, 4 + USB_DT_ENDPOINT_SIZE
-			+ (HIGHSPEED ? USB_DT_ENDPOINT_SIZE : 0));
-	if (err < 0) {
-		err = -errno;
-		fprintf(stderr, "config %s error %d (%s)\n",
-			name, errno, strerror(errno));
-		close(fd);
-		return err;
-	} else if (verbose)
-		fprintf(stderr, "%s start fd %d\n", name, fd);
-
-	return fd;
-}
-
-#define source_open(name) \
-	ep_config(name, &fs_source_desc, &hs_source_desc)
-#define sink_open(name) \
-	ep_config(name, &fs_sink_desc, &hs_sink_desc)
-#define int_open(name) \
-	ep_config(name, &fs_status_desc, &hs_status_desc)
-
-/*-------------------------------------------------------------------------*/
-
-static char *build_config(char *cp, const struct usb_endpoint_descriptor **ep)
-{
-	struct usb_config_descriptor *c;
-	int i;
-
-	c = (struct usb_config_descriptor *)cp;
-
-	memcpy(cp, &config, config.bLength);
-	cp += config.bLength;
-	memcpy(cp, &source_sink_intf, source_sink_intf.bLength);
-	cp += source_sink_intf.bLength;
-
-	for (i = 0; i < source_sink_intf.bNumEndpoints; i++) {
-		memcpy(cp, ep[i], USB_DT_ENDPOINT_SIZE);
-		cp += USB_DT_ENDPOINT_SIZE;
-	}
-	c->wTotalLength = __cpu_to_le16(cp - (char *)c);
-	return cp;
-}
-
-static void init_device(void)
-{
-	char		buf[4096], *cp = buf;
-	int		err;
-
-	err = autoconfig();
-	if (err < 0) {
-		fprintf(stderr, "?? don't recognize /dev/gadget bulk device\n");
-		control = err;
-		return;
-	}
-
-	control = open(DEVNAME, O_RDWR);
-	if (control < 0) {
-		perror(DEVNAME);
-		control = -errno;
-		return;
-	}
-
-	*(uint32_t *)cp = 0;	/* tag for this format */
-	cp += 4;
-
-	/* write full then high speed configs */
-	cp = build_config(cp, fs_eps);
-	if (HIGHSPEED)
-		cp = build_config(cp, hs_eps);
-
-	/* and device descriptor at the end */
-	memcpy(cp, &device_desc, sizeof device_desc);
-	cp += sizeof device_desc;
-
-	err = write(control, buf, cp - buf);
-	if (err < 0) {
-		perror("write dev descriptors");
-		close(control);
-		control = -errno;
-		return;
-	} else if (err != cp - buf) {
-		fprintf(stderr, "dev init, wrote %d expected %d\n",
-				err, (int)(cp - buf));
-		close(control);
-		control = -errno;
-		return;
-	}
-	return;
-}
-
-static const char *speed(enum usb_device_speed s)
-{
-	switch (s) {
-	case USB_SPEED_LOW:	return "low speed";
-	case USB_SPEED_FULL:	return "full speed";
-	case USB_SPEED_HIGH:	return "high speed";
-	default:		return "UNKNOWN speed";
-	}
 }
 
 /*-------------------------------------------------------------------------*/
@@ -2346,7 +1953,6 @@ done:
 static int start_io(void)
 {
 	int ret;
-	char buf[256];
 
 	if (verbose)
 		fprintf(stderr, "Start bulk EPs\n");
@@ -2354,18 +1960,15 @@ static int start_io(void)
 	if (bulk_in >= 0 && bulk_out >= 0)
 		return 0;
 
-	snprintf(buf, sizeof(buf), "/dev/gadget/%s", EP_IN_NAME);
-	bulk_in = source_open(buf);
+	bulk_in = open(FFS_PTP_IN, O_RDWR);
 	if (bulk_in < 0)
 		return bulk_in;
 
-	snprintf(buf, sizeof(buf), "/dev/gadget/%s", EP_OUT_NAME);
-	bulk_out = sink_open(buf);
+	bulk_out = open(FFS_PTP_OUT, O_RDWR);
 	if (bulk_out < 0)
 		return bulk_out;
 
-	snprintf(buf, sizeof(buf), "/dev/gadget/%s", EP_STATUS_NAME);
-	interrupt = int_open(buf);
+	interrupt = open(FFS_PTP_INT, O_RDWR);
 	if (interrupt < 0)
 		return interrupt;
 
@@ -2400,6 +2003,37 @@ static void stop_io(void)
 	interrupt = -EINVAL;
 }
 
+static void init_device(void)
+{
+	int		ret;
+
+	control = open(FFS_PTP_EP0, O_RDWR);
+	if (control < 0) {
+		perror(FFS_PTP_EP0);
+		control = -errno;
+		return;
+	}
+
+	ret = write(control, &descriptors, sizeof(descriptors));
+	if (ret < 0) {
+		perror("write dev descriptors");
+		close(control);
+		control = -errno;
+		return;
+	}
+	ret = write(control, &strings, sizeof(strings));
+	if (ret < 0) {
+		perror("write dev strings");
+		close(control);
+		control = -errno;
+		return;
+	}
+
+	return;
+}
+
+/*-------------------------------------------------------------------------*/
+
 static int reset_interface(void)
 {
 	/* just reset toggle/halt for the interface's endpoints */
@@ -2412,11 +2046,11 @@ static int reset_interface(void)
 
 	pthread_kill(bulk_pthread, SIGINT);
 
-	err = ioctl(bulk_in, GADGETFS_CLEAR_HALT);
+	err = ioctl(bulk_in, FUNCTIONFS_CLEAR_HALT);
 	if (err < 0)
 		perror("reset source fd");
 
-	err = ioctl(bulk_out, GADGETFS_CLEAR_HALT);
+	err = ioctl(bulk_out, FUNCTIONFS_CLEAR_HALT);
 	if (err < 0)
 		perror("reset sink fd");
 
@@ -2430,7 +2064,7 @@ static int reset_interface(void)
 
 static void handle_control(struct usb_ctrlrequest *setup)
 {
-	int		err, tmp;
+	int		err;
 	uint8_t		buf[256];
 	uint16_t	value, index, length;
 
@@ -2449,109 +2083,7 @@ static void handle_control(struct usb_ctrlrequest *setup)
 		goto special;
 	*/
 
-	switch (setup->bRequest) {	/* usb 2.0 spec ch9 requests */
-	case USB_REQ_GET_DESCRIPTOR:
-		if (setup->bRequestType != USB_DIR_IN)
-			goto stall;
-		switch (value >> 8) {
-		case USB_DT_STRING:
-			tmp = value & 0xff;
-			if (verbose > 1)
-				fprintf(stderr,
-					"... get string %d lang %04x\n",
-					tmp, index);
-			if (tmp != 0 && index != strings.language)
-				goto stall;
-			err = usb_gadget_get_string(&strings, tmp, buf);
-			if (err < 0)
-				goto stall;
-			tmp = err;
-			if (length < tmp)
-				tmp = length;
-			err = write(control, buf, tmp);
-			if (err < 0) {
-				if (errno == EIDRM)
-					fprintf(stderr, "string timeout\n");
-				else
-					perror("write string data");
-			} else if (err != tmp) {
-				fprintf(stderr, "short string write, %d\n",
-					err);
-			}
-			break;
-		default:
-			goto stall;
-		}
-		return;
-	case USB_REQ_SET_CONFIGURATION:
-		if (setup->bRequestType != USB_DIR_OUT)
-			goto stall;
-		if (verbose)
-			fprintf(stderr, "CONFIG #%d\n", value);
-
-		/* Kernel is normally waiting for us to finish reconfiguring
-		 * the device.
-		 *
-		 * Some hardware can't, notably older PXA2xx hardware.  (With
-		 * racey and restrictive config change automagic.  PXA 255 is
-		 * OK, most PXA 250s aren't.  If it has a UDC CFR register,
-		 * it can handle deferred response for SET_CONFIG.)  To handle
-		 * such hardware, don't write code this way ... instead, keep
-		 * the endpoints always active and don't rely on seeing any
-		 * config change events, either this or SET_INTERFACE.
-		 */
-		switch (value) {
-		case CONFIG_VALUE:
-			start_io();
-			break;
-		case 0:
-			stop_io();
-			break;
-		default:
-			/* kernel bug -- "can't happen" */
-			fprintf(stderr, "? illegal config\n");
-			goto stall;
-		}
-
-		/* ... ack (a write would stall) */
-		err = read(control, &err, 0);
-		if (err)
-			perror("ack SET_CONFIGURATION");
-		return;
-	case USB_REQ_GET_INTERFACE:
-		if (setup->bRequestType != (USB_DIR_IN|USB_RECIP_INTERFACE)
-				|| index != 0
-				|| length > 1)
-			goto stall;
-
-		/* only one altsetting in this driver */
-		buf[0] = 0;
-		err = write(control, buf, length);
-		if (err < 0) {
-			if (errno == EIDRM)
-				fprintf(stderr, "GET_INTERFACE timeout\n");
-			else
-				perror("write GET_INTERFACE data");
-		} else if (err != length) {
-			fprintf(stderr, "short GET_INTERFACE write, %d\n",
-				err);
-		}
-		return;
-	case USB_REQ_SET_INTERFACE:
-		if (setup->bRequestType != USB_RECIP_INTERFACE
-				|| index != 0
-				|| value != 0)
-			goto stall;
-
-		err = reset_interface();
-		if (err)
-			goto stall;
-
-		/* ... and ack (a write would stall) */
-		err = read(control, &err, 0);
-		if (err)
-			perror("ack SET_INTERFACE");
-		return;
+	switch (setup->bRequest) {
 	/* Still Image class-specific requests */
 	case USB_REQ_PTP_CANCEL_REQUEST:
 		return;
@@ -2616,8 +2148,18 @@ stall:
 
 static int read_control(void)
 {
-	struct usb_gadgetfs_event event[NEVENT];
+	struct usb_functionfs_event event[NEVENT];
 	int i, nevent, ret;
+
+	static const char * const names[] = {
+		[FUNCTIONFS_BIND] = "BIND",
+		[FUNCTIONFS_UNBIND] = "UNBIND",
+		[FUNCTIONFS_ENABLE] = "ENABLE",
+		[FUNCTIONFS_DISABLE] = "DISABLE",
+		[FUNCTIONFS_SETUP] = "SETUP",
+		[FUNCTIONFS_SUSPEND] = "SUSPEND",
+		[FUNCTIONFS_RESUME] = "RESUME",
+	};
 
 	ret = read(control, &event, sizeof(event));
 	if (ret < 0) {
@@ -2631,35 +2173,28 @@ static int read_control(void)
 	nevent = ret / sizeof event[0];
 
 	for (i = 0; i < nevent; i++) {
+		if (verbose)
+			fprintf(stderr,
+				"Event %s,%d", names[event->type], event[i].type);
+
 		switch (event[i].type) {
-		case GADGETFS_NOP:
-			if (verbose)
-				fprintf(stderr, "NOP\n");
+		case FUNCTIONFS_BIND:
 			break;
-		case GADGETFS_CONNECT:
-			if (status != PTP_WAITCONFIG)
-				status = PTP_IDLE;
-			current_speed = event[i].u.speed;
-			if (verbose)
-				fprintf(stderr,
-					"CONNECT %s\n",
-				    speed(event[i].u.speed));
+		case FUNCTIONFS_UNBIND:
 			break;
-		case GADGETFS_SETUP:
-			if (status != PTP_WAITCONFIG)
-				status = PTP_IDLE;
+		case FUNCTIONFS_ENABLE:
+			start_io();
+			break;
+		case FUNCTIONFS_DISABLE:
+			stop_io();
+			break;
+		case FUNCTIONFS_SETUP:
 			handle_control(&event[i].u.setup);
 			break;
-		case GADGETFS_DISCONNECT:
-			status = PTP_WAITCONFIG;
-			current_speed = USB_SPEED_UNKNOWN;
-			if (verbose)
-				fprintf(stderr, "DISCONNECT\n");
+		case FUNCTIONFS_SUSPEND:
 			break;
-		case GADGETFS_SUSPEND:
-			if (verbose)
-				fprintf(stderr, "SUSPEND\n");
-			stop_io();
+		case FUNCTIONFS_RESUME:
+			break;
 			break;
 		default:
 			fprintf(stderr,
@@ -3096,8 +2631,8 @@ int main(int argc, char *argv[])
 
 	enum_objects(root);
 
-	if (chdir("/dev/gadget") < 0) {
-		perror("can't chdir /dev/gadget");
+	if (chdir("/dev/ptp") < 0) {
+		perror("can't chdir /dev/ptp");
 		exit(EXIT_FAILURE);
 	}
 
