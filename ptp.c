@@ -725,7 +725,7 @@ static int send_association(int n, struct ptp_container *s, size_t size)
 {
 	struct ptp_object_info *objinfo = (struct ptp_object_info *)s->payload;
 	size_t len, total;
-	int ret;
+	int ret = -1;
 
 	s->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
 	memcpy(objinfo, &association, sizeof(association));
@@ -846,7 +846,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	uint32_t handle;
 	size_t count, total, offset, file_size;
 	void *data, *map;
-	int fd;
+	int fd = -1;
 	char name[256];
 
 	param = (uint32_t *)r_container->payload;
@@ -941,6 +941,7 @@ static int send_storage_ids(void *recv_buf, void *send_buf, size_t send_len)
 	struct ptp_container *s_container = send_buf;
 	uint32_t *param;
 	int ret;
+	(void) send_len;
 
 	s_container->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
 	s_container->length = __cpu_to_le32(20);
@@ -973,6 +974,7 @@ static int send_storage_info(void *recv_buf, void *send_buf, size_t send_len)
 	int ret;
 	size_t count;
 	struct statfs fs;
+	(void) send_len;
 
 	param = (uint32_t *)r_container->payload;
 	store_id = __le32_to_cpu(*param);
@@ -1526,7 +1528,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 	struct ptp_container *s_container = send_buf;
 	enum pima15740_response_code code = PIMA15740_RESP_OK;
 	struct obj_list *oi;
-	unsigned long length;
+	int length;
 	void *map;
 	int offset = sizeof(*r_container);
 	int fd, cnt = 0, obj_size, ret;
@@ -1687,7 +1689,7 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 	struct ptp_container *r_container = recv_buf;
 	struct ptp_container *s_container = send_buf;
 	uint32_t *param, p1, p2, p3;
-	unsigned long length = *recv_size, type, code, id;
+	unsigned long length = *recv_size, type = 0, code = 0, id = 0;
 	size_t count = 0;
 	int ret;
 
@@ -1952,6 +1954,7 @@ static void *bulk_thread(void *param)
 	void *recv_buf, *send_buf;
 	int ret;
 	size_t s_size = BUF_SIZE, r_size = BUF_SIZE;
+	(void) param;
 
 	pthread_cleanup_push(cleanup_bulk_thread, NULL);
 
@@ -2588,6 +2591,9 @@ static void init_strings(iconv_t ic)
 
 static void signothing(int sig, siginfo_t *info, void *ptr)
 {
+	(void) ptr;
+	(void) info;
+
 	/* NOP */
 	if (verbose > 2)
 		fprintf(stderr, "%s %d\n", __func__, sig);
@@ -2613,6 +2619,7 @@ int main(int argc, char *argv[])
 {
 	int c, ret;
 	struct stat root_stat;
+	images = NULL;
 
 	puts("Linux PTP Gadget v" VERSION_STRING);
 
