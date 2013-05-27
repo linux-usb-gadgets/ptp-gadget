@@ -2458,13 +2458,6 @@ static int enum_objects(const char *path)
 		if (!dot || dot == dentry->d_name)
 			continue;
 
-		if (strcasecmp(dot, ".tif") &&
-		    strcasecmp(dot, ".tiff") &&
-		    strcasecmp(dot, ".jpg") &&
-		    strcasecmp(dot, ".jpeg") &&
-		    strcasecmp(dot, ".txt"))
-			continue;
-
 		/* TODO: use identify from ImageMagick and parse its output */
 		switch (dot[1]) {
 		case 't':
@@ -2479,7 +2472,7 @@ static int enum_objects(const char *path)
 			format = PIMA15740_FMT_I_EXIF_JPEG;
 			break;
 		default:
-			format = PIMA15740_FMT_I_UNDEFINED;
+			format = PIMA15740_FMT_A_UNDEFINED;
 		}
 
 		ret = stat(dentry->d_name, &fstat);
