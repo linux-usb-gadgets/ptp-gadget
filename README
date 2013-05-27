@@ -18,15 +18,6 @@ processed. Thumbnails are created as compressed 160x120 pixel JFIF images and
 are stored under /var/cache/ptp/thumb/, so this directory must exist and be
 writable by the ptp-gadget user.
 
-To build use
-
-make KERNEL_SRC=<path-to-kernel-sources> CROSS_COMPILE=<cross-compiler-prefix>
-
-Of course, you can omit KERNEL_SRC if you have new enough linux headers in your
-build environment, and CROSS_COMPILE if you are compiling natively. To install
-
-make DESTDIR=<installation-prefix> install
-
 The program takes one compulsory parameter - the path to the directory, in which
 images are stored. Optionally, "-v" switches can be used to increment verbosity
 level of the program.
