@@ -36,6 +36,13 @@ AC_PROG_LIBTOOL
 AM_INIT_AUTOMAKE([foreign no-exeext dist-bzip2])
 
 
+##
+# glib
+##
+REQUIRES_GLIB="glib >= 2.24"
+AC_SUBST(REQUIRES_GLIB)
+PKG_CHECK_MODULES([GLIB], [glib-2.0 > 2.24])
+
 #
 # Debugging
 #

@@ -19,6 +19,7 @@
 #include <iconv.h>
 #include <dirent.h>
 #include <stdint.h>
+#include <glib.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -514,7 +515,9 @@ struct obj_list {
 	struct ptp_object_info	info;
 };
 
-static struct obj_list *images;
+#define GFOREACH(item, list) for(iterator = list; (item = NULL, 1) && iterator && (item = iterator->data, 1); iterator = g_slist_next(iterator))
+
+static GSList *images;
 /* number of objects, including associations - decrement when deleting */
 static int object_number;
 static int last_object_number;
@@ -527,14 +530,16 @@ static size_t get_string(iconv_t ic, char *buf, const char *s, size_t len);
 static int object_handle_valid(unsigned int h)
 {
 	struct obj_list *obj;
+	GSList *iterator;
 
 	/* First two handles: dcim and PTP_MODEL_DIR */
 	if (h == 1 || h == 2)
 		return 1;
 
-	for (obj = images; obj; obj = obj->next)
+	GFOREACH(obj, images) {
 		if (obj->handle == h)
 			return 1;
+	}
 
 	return 0;
 }
@@ -619,10 +624,11 @@ static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 	uint32_t *param;
 	uint32_t store_id;
 	struct obj_list *obj;
+	GSList *iterator = NULL;
 	int ret;
 	uint32_t *handle;
 	uint32_t format, association;
-	int obj_to_send = object_number;
+	int obj_to_send = g_slist_length(images) + 2;
 
 	length	= __le32_to_cpu(r_container->length);
 
@@ -689,7 +695,7 @@ static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 		*handle++ = __cpu_to_le32(2);
 	}
 
-	for (obj = images; obj; obj = obj->next) {
+	GFOREACH(obj, images) {
 		if ((void *)handle == send_buf + send_len) {
 			ret = bulk_write(send_buf, send_len);
 			if (ret < 0) {
@@ -753,7 +759,8 @@ static int send_object_info(void *recv_buf, void *send_buf, size_t send_len)
 	struct ptp_container *r_container = recv_buf;
 	struct ptp_container *s_container = send_buf;
 	uint32_t *param;
-	struct obj_list *obj;
+	struct obj_list *obj = NULL;
+	GSList *iterator;
 	int ret;
 	uint32_t handle;
 	size_t count, total, offset;
@@ -788,9 +795,10 @@ static int send_object_info(void *recv_buf, void *send_buf, size_t send_len)
 		goto send_resp;
 	}
 
-	for (obj = images; obj; obj = obj->next)
+	GFOREACH(obj, images) {
 		if (obj->handle == handle)
 			break;
+	}
 
 	if (!obj) {
 		code = PIMA15740_RESP_INVALID_OBJECT_HANDLE;
@@ -832,7 +840,8 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	struct ptp_container *r_container = recv_buf;
 	struct ptp_container *s_container = send_buf;
 	uint32_t *param;
-	struct obj_list *obj;
+	struct obj_list *obj = NULL;
+	GSList *iterator;
 	int ret;
 	uint32_t handle;
 	size_t count, total, offset, file_size;
@@ -843,9 +852,10 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	param = (uint32_t *)r_container->payload;
 	handle = __le32_to_cpu(*param);
 
-	for (obj = images; obj; obj = obj->next)
+	GFOREACH(obj, images) {
 		if (obj->handle == handle)
 			break;
+	}
 
 	if (!obj) {
 		make_response(s_container, r_container, PIMA15740_RESP_INVALID_OBJECT_HANDLE,
@@ -1072,13 +1082,15 @@ static void dump_object_info(const struct ptp_object_info *i)
 #ifdef DEBUG
 static void dump_obj(const char *s)
 {
-	struct obj_list *obj = images;
+	struct obj_list *obj;
+	GSList *iterator;
 
 	printf("%s, object_number %d\n", s, object_number);
 
-	for (; obj; obj = obj->next)
+	GFOREACH(obj, images) {
 		printf("obj: 0x%p, next 0x%p, handle %u, name %s\n",
 			obj, obj->next, obj->handle, obj->name);
+	}
 	printf("\n");
 }
 #endif
@@ -1174,6 +1186,8 @@ static void delete_object(void *recv_buf, void *send_buf)
 	struct ptp_container *s_container = send_buf;
 	enum pima15740_response_code code = PIMA15740_RESP_OK;
 	uint32_t format, handle;
+	struct obj_list *obj = NULL;
+	GSList *iterator;
 	uint32_t *param;
 	unsigned long length;
 	int ret = 0;
@@ -1202,28 +1216,20 @@ static void delete_object(void *recv_buf, void *send_buf)
 	}
 
 	if (handle == PTP_PARAM_ANY) {
-		struct obj_list *obj, **anchor;
 		int partial = 0;
 
-		anchor = &images;
-		obj = images;
-
-		if (!obj) {
+		if (!g_slist_length(images) + 2) {
 			code = PIMA15740_RESP_OK;
 			goto resp;
 		}
 
-		while (obj) {
+		GFOREACH(obj, images) {
 			code = delete_file(obj->name);
 			if (code == PIMA15740_RESP_OK) {
 				delete_thumb(obj);
-				*anchor = obj->next;
+				images = g_slist_remove(images, obj);
 				free(obj);
-				obj = *anchor;
-				object_number--;
 			} else {
-				anchor = &obj->next;
-				obj = obj->next;
 				partial++;
 			}
 		}
@@ -1231,25 +1237,17 @@ static void delete_object(void *recv_buf, void *send_buf)
 		if (partial)
 			code = PIMA15740_RESP_PARTIAL_DELETION;
 	} else {
-		struct obj_list *obj, **anchor;
-
-		anchor = &images;
-		obj = images;
-
-		while (obj) {
+		GFOREACH(obj, images) {
 			if (obj->handle == handle)
 				break;
-			anchor = &obj->next;
-			obj = obj->next;
 		}
 
 		if (obj) {
 			code = delete_file(obj->name);
 			if (code == PIMA15740_RESP_OK) {
 				delete_thumb(obj);
-				*anchor = obj->next;
+				images = g_slist_remove(images, obj);
 				free(obj);
-				object_number--;
 			}
 		} else {
 			code = PIMA15740_RESP_INVALID_OBJECT_HANDLE;
@@ -1527,7 +1525,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 	struct ptp_container *r_container = (struct ptp_container *)recv_buf;
 	struct ptp_container *s_container = send_buf;
 	enum pima15740_response_code code = PIMA15740_RESP_OK;
-	struct obj_list *obj, *oi;
+	struct obj_list *oi;
 	unsigned long length;
 	void *map;
 	int offset = sizeof(*r_container);
@@ -1652,14 +1650,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 
 link:
 	object_info_p->next = 0;
-	if (images) {
-		obj = images;
-		while (obj->next)
-			obj = obj->next;
-		obj->next = object_info_p;
-	} else {
-		images = object_info_p;
-	}
+	images = g_slist_append(images, object_info_p);
 
 	len = strlen(object_info_p->name);
 	if (len > 250) {
@@ -1854,14 +1845,14 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 					/* Contents of 100LINUX */
 					code = PIMA15740_RESP_OK;
 					ret += sizeof(*param);
-					*param = __cpu_to_le32(object_number - 2);
+					*param = __cpu_to_le32(g_slist_length(images));
 				} else
 					code = PIMA15740_RESP_INVALID_PARENT_OBJECT;
 			} else {
 				/* No parent Association specified or 0 */
 				code = PIMA15740_RESP_OK;
 				ret += sizeof(*param);
-				*param = __cpu_to_le32(object_number);
+				*param = __cpu_to_le32(g_slist_length(images) + 2);
 			}
 			make_response(s_container, r_container, code, ret);
 			count = 0;
@@ -2441,7 +2432,7 @@ static int enum_objects(const char *path)
 	char /*creat[32], creat_ucs2[64], */mod[32], mod_ucs2[64], fname_ucs2[512];
 	DIR *d;
 	int ret;
-	struct obj_list **obj = &images;
+	struct obj_list *obj;
 	/* First two handles used for /DCIM/PTP_MODEL_DIR */
 	uint32_t handle = 2;
 
@@ -2521,14 +2512,14 @@ static int enum_objects(const char *path)
 		}
 
 		/* namelen and datelen include terminating '\0', plus 4 string-size bytes */
-		osize = sizeof(**obj) + 2 * (datelen + namelen) + 4;
+		osize = sizeof(*obj) + 2 * (datelen + namelen) + 4;
 
 		if (verbose)
 			fprintf(stderr, "Listing image %s, modified %s, info-size %u\n",
 				dentry->d_name, mod, (unsigned int)osize);
 
-		*obj = malloc(osize);
-		if (!*obj) {
+		obj = malloc(osize);
+		if (!obj) {
 			ret = -1;
 			break;
 		}
@@ -2545,40 +2536,39 @@ static int enum_objects(const char *path)
 			thumb_height = THUMB_HEIGHT;
 		}
 
-		(*obj)->handle = ++handle;
+		obj->handle = ++handle;
 
 		/* Fixed size object info, filename, capture date, and two empty strings */
-		(*obj)->info_size = sizeof((*obj)->info) + 2 * (datelen + namelen) + 4;
+		obj->info_size = sizeof(obj->info) + 2 * (datelen + namelen) + 4;
 
-		(*obj)->info.storage_id			= __cpu_to_le32(STORE_ID);
-		(*obj)->info.object_format		= __cpu_to_le16(format);
-		(*obj)->info.protection_status		= __cpu_to_le16(fstat.st_mode & S_IWUSR ? 0 : 1);
-		(*obj)->info.object_compressed_size	= __cpu_to_le32(fstat.st_size);
-		(*obj)->info.thumb_format		= __cpu_to_le16(thumb_format);
-		(*obj)->info.thumb_compressed_size	= __cpu_to_le32(thumb_size);
-		(*obj)->info.thumb_pix_width		= __cpu_to_le32(thumb_width);
-		(*obj)->info.thumb_pix_height		= __cpu_to_le32(thumb_height);
-		(*obj)->info.image_pix_width		= __cpu_to_le32(0);	/* 0 == */
-		(*obj)->info.image_pix_height		= __cpu_to_le32(0);	/* not */
-		(*obj)->info.image_bit_depth		= __cpu_to_le32(0);	/* supported */
-		(*obj)->info.parent_object		= __cpu_to_le32(2);	/* Fixed /dcim/xxx/ */
-		(*obj)->info.association_type		= __cpu_to_le16(0);
-		(*obj)->info.association_desc		= __cpu_to_le32(0);
-		(*obj)->info.sequence_number		= __cpu_to_le32(0);
-		strncpy((*obj)->name, dentry->d_name, sizeof((*obj)->name));
+		obj->info.storage_id			= __cpu_to_le32(STORE_ID);
+		obj->info.object_format			= __cpu_to_le16(format);
+		obj->info.protection_status		= __cpu_to_le16(fstat.st_mode & S_IWUSR ? 0 : 1);
+		obj->info.object_compressed_size	= __cpu_to_le32(fstat.st_size);
+		obj->info.thumb_format			= __cpu_to_le16(thumb_format);
+		obj->info.thumb_compressed_size		= __cpu_to_le32(thumb_size);
+		obj->info.thumb_pix_width		= __cpu_to_le32(thumb_width);
+		obj->info.thumb_pix_height		= __cpu_to_le32(thumb_height);
+		obj->info.image_pix_width		= __cpu_to_le32(0);	/* 0 == */
+		obj->info.image_pix_height		= __cpu_to_le32(0);	/* not */
+		obj->info.image_bit_depth		= __cpu_to_le32(0);	/* supported */
+		obj->info.parent_object			= __cpu_to_le32(2);	/* Fixed /dcim/xxx/ */
+		obj->info.association_type		= __cpu_to_le16(0);
+		obj->info.association_desc		= __cpu_to_le32(0);
+		obj->info.sequence_number		= __cpu_to_le32(0);
+		strncpy(obj->name, dentry->d_name, sizeof(obj->name));
 
-		(*obj)->info.strings[0]					= namelen;
-		memcpy((*obj)->info.strings + 1, fname_ucs2, namelen * 2);
+		obj->info.strings[0]					= namelen;
+		memcpy(obj->info.strings + 1, fname_ucs2, namelen * 2);
 		/* We use file modification date as Capture Date */
-		(*obj)->info.strings[1 + namelen * 2]			= datelen;
-		memcpy((*obj)->info.strings + 2 + namelen * 2, mod_ucs2, datelen * 2);
+		obj->info.strings[1 + namelen * 2]			= datelen;
+		memcpy(obj->info.strings + 2 + namelen * 2, mod_ucs2, datelen * 2);
 		/* Empty Modification Date */
-		(*obj)->info.strings[2 + (namelen + datelen) * 2]	= 0;
+		obj->info.strings[2 + (namelen + datelen) * 2]	= 0;
 		/* Empty Keywords */
-		(*obj)->info.strings[3 + (namelen + datelen) * 2]	= 0;
+		obj->info.strings[3 + (namelen + datelen) * 2]	= 0;
 
-		obj = &(*obj)->next;
-		*obj = NULL;
+		images = g_slist_append(images, obj);
 	}
 
 	object_number = handle;
