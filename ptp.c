@@ -1696,8 +1696,9 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	char lock_file[256];
 	char new_file[256];
 	mode_t mode;
-	int fd;
-	int ret = 0;
+	int fd, fd_new;
+	int ret = 0, len;
+	char fs_buf[32];
 
 	param = (uint32_t *)r_container->payload;
 	p1 = __le32_to_cpu(*param);
@@ -1748,10 +1749,14 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 		break;
 	}
 
-	if (info->object_compressed_size > storage_info.free_space_in_bytes) {
+	if (((uint64_t)__le32_to_cpu(info->object_compressed_size)) >
+	    __le64_to_cpu(storage_info.free_space_in_bytes)) {
 		code = PIMA15740_RESP_STORE_FULL;
-		if (verbose)
-			fprintf(stdout, "no space\n");
+		if (verbose) {
+			fprintf(stdout, "no space: free %lld, req. %d\n",
+				storage_info.free_space_in_bytes,
+				info->object_compressed_size);
+		}
 		goto resp;
 	}
 
@@ -1828,9 +1833,9 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 		goto err;
 	}
 
-	ret = link(lock_file, new_file);
-	if (ret < 0) {
-		fprintf(stderr, "link: old %s, new %s: %s\n",
+	fd_new = open(new_file, O_CREAT | O_EXCL | O_WRONLY, mode);
+	if (fd_new < 0) {
+		fprintf(stderr, "open: lock file %s, new file %s: %s\n",
 			lock_file, new_file, strerror(errno));
 		if (errno == EEXIST)
 			code = PIMA15740_RESP_STORE_NOT_AVAILABLE;
@@ -1845,24 +1850,27 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 		goto err;
 	}
 
-	ret = ftruncate(fd, info->object_compressed_size);
+	len = snprintf(fs_buf, sizeof(fs_buf), "%d",
+		       info->object_compressed_size);
+	ret = ftruncate(fd, len);
+	if (ret < 0) {
+		fprintf(stderr, "ftruncate for lock file: %s: %s\n",
+			lock_file, strerror(errno));
+		goto err_del;
+	}
+
+	ret = write(fd, fs_buf, len);
+	if (ret < 0) {
+		fprintf(stderr, "write new file size to %s: %s\n",
+			lock_file, strerror(errno));
+		goto err_del;
+	}
+
+	ret = ftruncate(fd_new, info->object_compressed_size);
 	if (ret < 0) {
 		fprintf(stderr, "ftruncate: %s: %s\n",
-			lock_file, strerror(errno));
-		code = PIMA15740_RESP_STORE_FULL;
-		close(fd);
-
-		ret = unlink(new_file);
-		if (ret < 0)
-			fprintf(stderr, "can't remove %s: %s\n",
-				new_file, strerror(errno));
-
-		ret = unlink(lock_file);
-		if (ret < 0)
-			fprintf(stderr, "can't remove %s: %s\n",
-				lock_file, strerror(errno));
-
-		goto err;
+			new_file, strerror(errno));
+		goto err_del;
 	}
 
 	memcpy(&object_info_p->info, info, new_info_size);
@@ -1881,9 +1889,25 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	param[2] = __cpu_to_le32(last_object_number);
 
 	close(fd);
+	close(fd_new);
 resp:
 	make_response(s_container, r_container, code, sizeof(*s_container) + 12);
 	return 0;
+
+err_del:
+	code = PIMA15740_RESP_STORE_FULL;
+	close(fd);
+	close(fd_new);
+
+	ret = unlink(new_file);
+	if (ret < 0)
+		fprintf(stderr, "can't remove %s: %s\n",
+			new_file, strerror(errno));
+
+	ret = unlink(lock_file);
+	if (ret < 0)
+		fprintf(stderr, "can't remove %s: %s\n",
+			lock_file, strerror(errno));
 err:
 	free(object_info_p);
 	object_info_p = 0;
@@ -1980,19 +2004,29 @@ static int process_send_object(void *recv_buf, void *send_buf)
 
 	/* more data? */
 	if (obj_size > cnt) {
+		unsigned int rest, recv_len;
+		void *data = map + cnt;
+
 		if (verbose) {
 			fprintf(stderr, "Reading rest %d of %d\n",
 				obj_size - cnt, obj_size);
 		}
-		ret = bulk_read(map + cnt, obj_size - cnt);
-		if (ret < 0) {
-			fprintf(stderr, "%s: reading data for %s failed: %s\n",
-				__func__, object_info_p->name, strerror(errno));
-			code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
-			munmap(map, obj_size);
-			close(fd);
-			errno = EPIPE;
-			return ret;
+		rest = obj_size - cnt;
+		recv_len = 8192;
+		while (rest) {
+			cnt = min(rest, recv_len);
+			ret = bulk_read(data, cnt);
+			if (ret < 0) {
+				fprintf(stderr, "%s: reading data for %s failed: %s\n",
+					__func__, object_info_p->name, strerror(errno));
+				code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
+				munmap(map, obj_size);
+				close(fd);
+				errno = EPIPE;
+				return ret;
+			}
+			rest -= ret;
+			data += ret;
 		}
 	}
 
@@ -2712,7 +2746,9 @@ static void clean_up(const char *path)
 	struct dirent *dentry;
 	DIR *d;
 	char file_name[256];
-	int ret;
+	int fd, ret;
+	char *endptr;
+	char fs_buf[32];
 
 	ret = chdir(path);
 	if (ret < 0)
@@ -2723,7 +2759,7 @@ static void clean_up(const char *path)
 	while ((dentry = readdir(d))) {
 		struct stat fstat;
 		char *dot;
-		int lsize, fsize;
+		unsigned long lsize, fsize;
 
 		dot = strrchr(dentry->d_name, '.');
 
@@ -2737,17 +2773,50 @@ static void clean_up(const char *path)
 		snprintf(file_name, sizeof(file_name), "%s", dentry->d_name);
 		*dot = '.';
 
-		ret = stat(dentry->d_name, &fstat);
-		if (ret < 0) {
-			fprintf(stderr, "%s: stat %s: %s\n",
+		fd = open(dentry->d_name, O_RDONLY);
+		if (fd < 0) {
+			fprintf(stderr, "%s: open %s: %s\n",
 				__func__, dentry->d_name, strerror(errno));
 			continue;
 		}
 
-		lsize = fstat.st_size;
+		memset(fs_buf, 0, sizeof(fs_buf));
+		ret = read(fd, fs_buf, sizeof(fs_buf));
+		if (ret < 0) {
+			fprintf(stderr, "%s: read %s: %s\n",
+				__func__, dentry->d_name, strerror(errno));
+			close(fd);
+			continue;
+		}
+		close(fd);
+
+		if (ret) {
+			lsize = strtoul(fs_buf, &endptr, 10);
+			fprintf(stdout, "%s: *endptr %x\n", __func__, *endptr);
+			/*
+			 * if not entire string is valid, then this file was not
+			 * created by ptp, so skip it.
+			 */
+			if (fs_buf == endptr) {
+				fprintf(stderr, "%s: can't get size of locked "
+					"file %s\n", __func__, dentry->d_name);
+				continue;
+			}
+			if (*endptr != 0)
+				continue;
+		} else {
+			/* delete empty lock */
+			ret = unlink(dentry->d_name);
+			if (ret < 0)
+				fprintf(stderr, "%s: %s: %s\n",
+					__func__, dentry->d_name,
+					strerror(errno));
+			continue;
+		}
 
 		ret = stat(file_name, &fstat);
 		if (ret < 0) {
+			/* no corresponding object file, so delete lock file */
 			fprintf(stderr, "%s: stat %s: %s\n",
 				__func__, file_name, strerror(errno));
 			ret = unlink(dentry->d_name);
@@ -2760,6 +2829,11 @@ static void clean_up(const char *path)
 
 		fsize = fstat.st_size;
 		if (lsize == fsize) {
+			/* locked file size is the same as the reserved size,
+			 * but lock file was not deleted. This means transaction
+			 * was not completed, so delete both, lock file and
+			 * appropriate object file.
+			 */
 			if (verbose)
 				printf("remove %s, %s\n",
 					dentry->d_name, file_name);
@@ -2772,6 +2846,7 @@ static void clean_up(const char *path)
 				fprintf(stderr, "%s: %s: %s\n",
 					__func__, file_name, strerror(errno));
 		} else {
+			/* no corresponding object file, so delete lock file */
 			if (verbose)
 				printf("remove %s\n", dentry->d_name);
 			ret = unlink(dentry->d_name);
@@ -2780,6 +2855,7 @@ static void clean_up(const char *path)
 					__func__, dentry->d_name, strerror(errno));
 		}
 	}
+	closedir(d);
 }
 
 static int enum_objects(const char *path)
@@ -3007,6 +3083,15 @@ int main(int argc, char *argv[])
 	root = argv[argc - 1];
 
 	clean_up(root);
+
+	/*
+	 * if a client doesn't ask for storage info (as seen with some
+	 * older SW versions, e.g. on Ubuntu 8.04), then the free space
+	 * in storage_info will not be updated. This might result in non
+	 * working upload because before upload the free space will be
+	 * checked. Prevent this by running update_free_space() early.
+	 */
+	update_free_space();
 
 	enum_objects(root);
 
