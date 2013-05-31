@@ -242,7 +242,7 @@ static enum usb_device_speed current_speed;
 #define CHECK_COUNT(cnt, min, max, op) do {			\
 	if (cnt & 3 || cnt < min || cnt > max) {		\
 		fprintf(stderr, "Wrong " op " size: %u\n",	\
-			cnt);					\
+			(unsigned int)cnt);					\
 		errno = EPIPE;					\
 		return -1;					\
 	}							\
@@ -353,6 +353,7 @@ enum pima15740_response_code {
 enum pima15740_data_format {
 	PIMA15740_FMT_A_UNDEFINED		= 0x3000,
 	PIMA15740_FMT_A_ASSOCIATION		= 0x3001,
+	PIMA15740_FMT_A_TEXT			= 0x3004,
 	PIMA15740_FMT_I_UNDEFINED		= 0x3800,
 	PIMA15740_FMT_I_EXIF_JPEG		= 0x3801,
 	PIMA15740_FMT_I_TIFF_EP			= 0x3802,
@@ -398,13 +399,17 @@ static const char storage_desc[] = PTP_STORAGE_DESC;
 	__constant_cpu_to_le16(PIMA15740_OP_GET_OBJECT_INFO),	\
 	__constant_cpu_to_le16(PIMA15740_OP_GET_OBJECT),	\
 	__constant_cpu_to_le16(PIMA15740_OP_GET_THUMB),		\
-	__constant_cpu_to_le16(PIMA15740_OP_DELETE_OBJECT),
+	__constant_cpu_to_le16(PIMA15740_OP_DELETE_OBJECT),	\
+	__constant_cpu_to_le16(PIMA15740_OP_SEND_OBJECT_INFO),	\
+	__constant_cpu_to_le16(PIMA15740_OP_SEND_OBJECT),
 
 static uint16_t dummy_supported_operations[] = {
 	SUPPORTED_OPERATIONS
 };
 
 #define SUPPORTED_FORMATS					\
+	__constant_cpu_to_le16(PIMA15740_FMT_A_UNDEFINED),	\
+	__constant_cpu_to_le16(PIMA15740_FMT_A_TEXT),		\
 	__constant_cpu_to_le16(PIMA15740_FMT_I_EXIF_JPEG),	\
 	__constant_cpu_to_le16(PIMA15740_FMT_I_TIFF_EP),	\
 	__constant_cpu_to_le16(PIMA15740_FMT_I_PNG),		\
@@ -489,7 +494,7 @@ static int interrupt = -ENXIO;
 static int session = -EINVAL;
 static sem_t reset;
 
-static iconv_t ic;
+static iconv_t ic, uc;
 static char *root;
 
 #define	NEVENT		5
@@ -562,8 +567,12 @@ struct obj_list {
 static struct obj_list *images;
 /* number of objects, including associations - decrement when deleting */
 static int object_number;
+static int last_object_number;
+
+static struct obj_list *object_info_p;
 
 static size_t put_string(iconv_t ic, char *buf, const char *s, size_t len);
+static size_t get_string(iconv_t ic, char *buf, const char *s, size_t len);
 
 static int object_handle_valid(unsigned int h)
 {
@@ -905,7 +914,7 @@ static void init_device(void)
 		return;
 	} else if (err != cp - buf) {
 		fprintf(stderr, "dev init, wrote %d expected %d\n",
-				err, cp - buf);
+				err, (int)(cp - buf));
 		close(control);
 		control = -errno;
 		return;
@@ -952,7 +961,30 @@ static int bulk_write(void *buf, size_t length)
 	} while (count < length);
 
 	if (verbose)
-		fprintf(stderr, "BULK-IN Sent %u bytes\n", count);
+		fprintf(stderr, "BULK-IN Sent %u bytes\n", (unsigned int)count);
+
+	return count;
+}
+
+static int bulk_read(void *buf, size_t length)
+{
+	size_t count = 0;
+	int ret;
+
+	do {
+		ret = read(bulk_out, buf + count, length - count);
+		if (ret < 0) {
+			if (errno != EINTR)
+				return ret;
+
+			/* Need to wait for control thread to finish reset */
+			sem_wait(&reset);
+		} else
+			count += ret;
+	} while (count < length);
+
+	if (verbose)
+		fprintf(stderr, "BULK-OUT Read %u bytes\n", (unsigned int)count);
 
 	return count;
 }
@@ -1137,7 +1169,7 @@ static int send_object_info(void *recv_buf, void *send_buf, size_t send_len)
 			}
 			size = dstat.st_size;
 			if (verbose > 1)
-				fprintf(stderr, "%s size %u\n", root, size);
+				fprintf(stderr, "%s size %u\n", root, (unsigned int)size);
 		} else
 			size = 4096;
 		ret = send_association(handle, s_container, size);
@@ -1372,6 +1404,81 @@ static int send_storage_info(void *recv_buf, void *send_buf, size_t send_len)
 	return 0;
 }
 
+#ifdef DEBUG
+const char *oid[] =
+{	"StorageID             ",
+	"ObjectFormat          ",
+	"ProtectionStatus      ",
+	"ObjectCommpressedSize ",
+	"ThumbFormat           ",
+	"ThumbCommpressedSize  ",
+	"ThumbPixWidth         ",
+	"ThumbPixHeight        ",
+	"ImagePixWidth         ",
+	"ImagePixHeight        ",
+	"ImageBitDepth         ",
+	"ParentObject          ",
+	"AssotiationType       ",
+	"AssotiationDesc       ",
+	"SequenceNumber        ",
+	"Filename              ",
+	"CaptureDate           ",
+	"ModificationDate      ",
+	"Keywords              ",
+};
+#endif
+
+static void dump_object_info(const struct ptp_object_info *i)
+{
+#ifdef DEBUG
+	char buf[256];
+	int idx;
+
+	fprintf(stdout, "%s\n", __func__);
+	fprintf(stdout, "-------------------------------\n");
+	fprintf(stdout, "%s: 0x%.8x\n", oid[0], i->storage_id);
+	fprintf(stdout, "%s: 0x%.4x\n", oid[1], i->object_format);
+	fprintf(stdout, "%s: 0x%.4x\n", oid[2], i->protection_status);
+	fprintf(stdout, "%s: %d\n",     oid[3], i->object_compressed_size);
+	fprintf(stdout, "%s: 0x%.4x\n", oid[4], i->thumb_format);
+	fprintf(stdout, "%s: %d\n",     oid[5], i->thumb_compressed_size);
+	fprintf(stdout, "%s: %d\n",     oid[6], i->thumb_pix_width);
+	fprintf(stdout, "%s: %d\n",     oid[7], i->thumb_pix_height);
+	fprintf(stdout, "%s: %d\n",	oid[8], i->image_pix_width);
+	fprintf(stdout, "%s: %d\n",	oid[9], i->image_pix_height);
+	fprintf(stdout, "%s: %d\n",	oid[10], i->image_bit_depth);
+	fprintf(stdout, "%s: 0x%.8x\n", oid[11], i->parent_object);
+	fprintf(stdout, "%s: 0x%.4x\n", oid[12], i->association_type);
+	fprintf(stdout, "%s: 0x%.8x\n", oid[13], i->association_desc);
+	fprintf(stdout, "%s: %d\n",	oid[14], i->sequence_number);
+	get_string(uc, (char *)buf, (const char *)&i->strings[1],
+		   i->strings[0]);
+	fprintf(stdout, "%s: %s, len: %d\n", oid[15], buf, i->strings[0]);
+	idx = i->strings[0] * 2 + 1;
+	if (i->strings[idx]) {
+		get_string(uc, (char *)buf, (const char *)&i->strings[idx + 1],
+			   i->strings[idx]);
+		fprintf(stdout, "%s: %s, len: %d\n",
+			oid[16], buf, i->strings[idx]);
+	}
+	fprintf(stdout, "-------------------------------\n");
+#endif
+}
+
+static void dump_obj(const char *s)
+{
+#ifdef DEBUG
+	struct obj_list *obj = images;
+
+	printf("%s, object_number %d\n", s, object_number);
+
+	for (; obj; obj = obj->next)
+		printf("obj: 0x%p, next 0x%p, handle %u, name %s\n",
+			obj, obj->next, obj->handle, obj->name);
+	printf("\n");
+#endif
+}
+
 static void delete_thumb(struct obj_list *obj)
 {
 	char thumb[256];
@@ -1553,6 +1660,394 @@ resp:
 	make_response(s_container, r_container, code, sizeof(*s_container));
 }
 
+static int read_container(void *recv_buf, size_t recv_size)
+{
+	size_t count = 0;
+	int ret;
+
+	do {
+		ret = read(bulk_out, recv_buf + count, recv_size - count);
+		if (ret < 0) {
+			if (errno != EINTR)
+				return ret;
+
+			/* Need to wait for control thread to finish reset */
+			sem_wait(&reset);
+		} else {
+			count += ret;
+		}
+	} while (count < sizeof(struct ptp_container));
+
+	if (verbose > 1)
+		fprintf(stderr, "%s: read %u bytes, count %d length %u\n",
+			__func__, ret, (unsigned int)count, (unsigned int)recv_size);
+
+	return count;
+}
+
+static int process_send_object_info(void *recv_buf, void *send_buf)
+{
+	struct ptp_container *r_container = recv_buf;
+	struct ptp_container *s_container = send_buf;
+	enum pima15740_response_code code = PIMA15740_RESP_OK;
+	struct ptp_object_info *info;
+	uint32_t *param, p1, p2;
+	size_t new_info_size, alloc_size;
+	char lock_file[256];
+	char new_file[256];
+	mode_t mode;
+	int fd;
+	int ret = 0;
+
+	param = (uint32_t *)r_container->payload;
+	p1 = __le32_to_cpu(*param);
+	p2 = __le32_to_cpu(*(param + 1));
+
+	if (verbose) {
+		fprintf(stderr, "store_id 0x%lx, parent handle 0x%lx\n",
+			(unsigned long)p1, (unsigned long)p2);
+	}
+
+	/* Read ObjectInfo comming in the data phase */
+	ret = read_container(recv_buf, BUF_SIZE);
+	if (ret < 0) {
+		code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
+		goto resp;
+	}
+
+	if (p1 != STORE_ID) {
+		code = PIMA15740_RESP_INVALID_STORAGE_ID;
+		goto resp;
+	}
+	if (p2 != 2) {
+		code = PIMA15740_RESP_SPECIFICATION_OF_DESTINATION_UNSUPPORTED;
+		goto resp;
+	}
+
+	new_info_size = ret - sizeof(*r_container);
+	alloc_size = (new_info_size - sizeof(struct ptp_object_info)) +
+		     sizeof(struct obj_list);
+	if (verbose) {
+		fprintf(stdout, "new object_info size %d\n",
+			(unsigned int)new_info_size);
+	}
+
+	info = (struct ptp_object_info *)r_container->payload;
+	dump_object_info(info);
+
+	switch (info->object_format) {
+	case PIMA15740_FMT_A_UNDEFINED:
+	case PIMA15740_FMT_A_TEXT:
+	case PIMA15740_FMT_I_EXIF_JPEG:
+	case PIMA15740_FMT_I_TIFF:
+		code = PIMA15740_RESP_OK;
+		break;
+	default:
+		code = PIMA15740_RESP_INVALID_OBJECT_FORMAT_CODE;
+		goto resp;
+		break;
+	}
+
+	if (info->object_compressed_size > storage_info.free_space_in_bytes) {
+		code = PIMA15740_RESP_STORE_FULL;
+		fprintf(stdout, "no space\n");
+		goto resp;
+	}
+
+	ret = chdir(root);
+	if (ret) {
+		fprintf(stderr, "chdir: %s: %s\n", root, strerror(errno));
+		code = PIMA15740_RESP_STORE_NOT_AVAILABLE;
+		goto resp;
+	}
+
+	if (object_info_p) {
+		/* replace previously allocated info, free resources */
+		int len;
+		char c;
+
+		len = strlen(object_info_p->name);
+		if (len > 250) {
+			c = object_info_p->name[250];
+			object_info_p->name[250] = '\0';
+		}
+		snprintf(lock_file, 256, "%s.lock", object_info_p->name);
+		if (len > 250)
+			object_info_p->name[250] = c;
+
+		ret = unlink(lock_file);
+		if (ret < 0)
+			fprintf(stderr, "can't remove %s: %s",
+				lock_file, strerror(errno));
+
+		ret = unlink(object_info_p->name);
+		if (ret < 0)
+			fprintf(stderr, "can't remove %s: %s",
+				lock_file, strerror(errno));
+
+		free(object_info_p);
+		last_object_number--;
+	}
+
+	object_info_p = malloc(alloc_size);
+	if (!object_info_p) {
+		perror("object info allocation failed");
+		code = PIMA15740_RESP_GENERAL_ERROR;
+		goto resp;
+	}
+
+	ret = get_string(uc, (char *)new_file, (const char *)&info->strings[1],
+			 info->strings[0]);
+	if (ret < 0) {
+		fprintf(stderr, "Filename conversion failed: %d\n", ret);
+		code = PIMA15740_RESP_GENERAL_ERROR;
+		goto err;
+	}
+
+	snprintf(lock_file, 255, "%s.lock", new_file);
+
+	mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+	if (info->protection_status & 0x0001)
+		mode &= ~S_IWUSR;
+
+	if (verbose > 1) {
+		fprintf(stdout, "Lock Filename: %s\n", lock_file);
+		fprintf(stdout, "New Filename: %s, size %d\n",
+			new_file, info->object_compressed_size);
+	}
+
+	fd = open(lock_file, O_CREAT | O_EXCL | O_WRONLY, mode);
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", lock_file, strerror(errno));
+		if (errno == EEXIST)
+			code = PIMA15740_RESP_STORE_NOT_AVAILABLE;
+		else
+			code = PIMA15740_RESP_GENERAL_ERROR;
+
+		goto err;
+	}
+
+	ret = link(lock_file, new_file);
+	if (ret < 0) {
+		fprintf(stderr, "link: old %s, new %s: %s\n",
+			lock_file, new_file, strerror(errno));
+		if (errno == EEXIST)
+			code = PIMA15740_RESP_STORE_NOT_AVAILABLE;
+		else
+			code = PIMA15740_RESP_GENERAL_ERROR;
+
+		close(fd);
+		ret = unlink(lock_file);
+		if (ret < 0)
+			perror ("can't remove lock file");
+
+		goto err;
+	}
+
+	ret = ftruncate(fd, info->object_compressed_size);
+	if (ret < 0) {
+		fprintf(stderr, "ftruncate: %s: %s\n",
+			lock_file, strerror(errno));
+		code = PIMA15740_RESP_STORE_FULL;
+		close(fd);
+
+		ret = unlink(new_file);
+		if (ret < 0)
+			fprintf(stderr, "can't remove %s: %s\n",
+				new_file, strerror(errno));
+
+		ret = unlink(lock_file);
+		if (ret < 0)
+			fprintf(stderr, "can't remove %s: %s\n",
+				lock_file, strerror(errno));
+
+		goto err;
+	}
+
+	memcpy(&object_info_p->info, info, new_info_size);
+	snprintf(object_info_p->name, 256, "%s", new_file);
+	object_info_p->handle			= ++last_object_number;
+	object_info_p->info_size		= new_info_size;
+	object_info_p->info.storage_id		= __cpu_to_le32(STORE_ID);
+	object_info_p->info.parent_object	= __cpu_to_le32(2);	/* Fixed /dcim/xxx/ */
+	object_info_p->info.association_type	= __cpu_to_le16(0);
+	object_info_p->info.association_desc	= __cpu_to_le32(0);
+	object_info_p->info.sequence_number	= __cpu_to_le32(0);
+
+	param = (uint32_t *)&s_container->payload[0];
+	param[0] = __cpu_to_le32(STORE_ID);
+	param[1] = __cpu_to_le32(2);
+	param[2] = __cpu_to_le32(last_object_number);
+
+	close(fd);
+resp:
+	make_response(s_container, r_container, code, sizeof(*s_container) + 12);
+	return 0;
+err:
+	free(object_info_p);
+	object_info_p = 0;
+	make_response(s_container, r_container, code, sizeof(*s_container));
+	return -1;
+}
+
+static int generate_thumb(const char *);
+static int process_send_object(void *recv_buf, void *send_buf)
+{
+	struct ptp_container *r_container = (struct ptp_container *)recv_buf;
+	struct ptp_container *s_container = send_buf;
+	enum pima15740_response_code code = PIMA15740_RESP_OK;
+	struct obj_list *obj, *oi;
+	unsigned long length;
+	void *map;
+	int offset = sizeof(*r_container);
+	int fd, cnt = 0, obj_size, ret;
+	char lock_file[256];
+	int len;
+	char c;
+
+	/* start reading data phase */
+	ret = read_container(recv_buf, BUF_SIZE);
+	if (ret < 0) {
+		code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
+		goto resp;
+	}
+
+	cnt = ret - offset;
+	length = __le32_to_cpu(r_container->length) - offset;
+
+	if (!object_info_p) {
+		/* get remaining data, end data phase */
+		while (cnt < length) {
+			ret = read(bulk_out, recv_buf, BUF_SIZE);
+			if (ret < 0) {
+				errno = EPIPE;
+				return -1;
+			}
+			cnt += ret;
+		}
+		code = PIMA15740_RESP_NO_VALID_OBJECT_INFO;
+		goto resp;
+	}
+
+	oi = object_info_p;
+	obj_size = oi->info.object_compressed_size;
+
+	if (length != obj_size) {
+		/* less or more data as at SendObjectInfo */
+		while (cnt < length) {
+			ret = read(bulk_out, recv_buf, BUF_SIZE);
+			if (ret < 0) {
+				errno = EPIPE;
+				return -1;
+			}
+			cnt += ret;
+		}
+
+		if (length < obj_size)
+			code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
+		else
+			code = PIMA15740_RESP_STORE_FULL;
+
+		goto resp;
+	}
+
+	/* empty file was send, don't need to write something */
+	if (!obj_size) {
+		code = PIMA15740_RESP_OK;
+		goto link;
+	}
+
+	fd = open(oi->name, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "%s: open %s: %s\n", __func__,
+			oi->name, strerror(errno));
+		code = PIMA15740_RESP_STORE_FULL;
+		goto resp;
+	}
+
+	map = mmap(NULL, obj_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "%s: mmap %s: %s\n", __func__,
+			oi->name, strerror(errno));
+		code = PIMA15740_RESP_STORE_FULL;
+		close(fd);
+		goto resp;
+	}
+
+	/* store first data block */
+	memcpy(map, recv_buf + offset, cnt);
+
+	/* more data? */
+	if (obj_size > cnt) {
+		if (verbose) {
+			fprintf(stderr, "Reading rest %d of %d\n",
+				obj_size - cnt, obj_size);
+		}
+		ret = bulk_read(map + cnt, obj_size - cnt);
+		if (ret < 0) {
+			fprintf(stderr, "%s: reading data for %s failed\n",
+				__func__, object_info_p->name);
+			code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
+			munmap(map, obj_size);
+			close(fd);
+			errno = EPIPE;
+			return ret;
+		}
+	}
+
+	munmap(map, obj_size);
+	close(fd);
+
+	if (oi->info.object_format != PIMA15740_FMT_A_UNDEFINED &&
+	    oi->info.object_format != PIMA15740_FMT_A_TEXT) {
+		ret = generate_thumb(object_info_p->name);
+		if (ret > 0) {
+			oi->info.thumb_format = __cpu_to_le16(PIMA15740_FMT_I_JFIF);
+			oi->info.thumb_compressed_size = __cpu_to_le32(ret);
+			oi->info.thumb_pix_width = __cpu_to_le32(THUMB_WIDTH);
+			oi->info.thumb_pix_height = __cpu_to_le32(THUMB_HEIGHT);
+		}
+	}
+
+link:
+	object_info_p->next = 0;
+	if (images) {
+		obj = images;
+		while (obj->next)
+			obj = obj->next;
+		obj->next = object_info_p;
+	} else {
+		images = object_info_p;
+	}
+
+	len = strlen(object_info_p->name);
+	if (len > 250) {
+		c = object_info_p->name[250];
+		object_info_p->name[250] = '\0';
+	}
+	snprintf(lock_file, 250, "%s.lock", object_info_p->name);
+	if (len > 250)
+		object_info_p->name[250] = c;
+
+	ret = unlink(lock_file);
+	if (ret < 0)
+		fprintf(stderr, "can't remove %s: %s",
+			lock_file, strerror(errno));
+
+	object_number++;
+	object_info_p = 0;
+	dump_obj("after link");
+
+	ret = update_free_space();
+	if (ret < 0)
+		code = PIMA15740_RESP_STORE_NOT_AVAILABLE;
+
+resp:
+	make_response(s_container, r_container, code, sizeof(*s_container));
+
+	return 0;
+}
+
 static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf, size_t *send_size)
 {
 	struct ptp_container *r_container = recv_buf;
@@ -1584,7 +2079,7 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 	if (count > length) {
 		/* TODO: have to stall according to Figure 7.2-1? */
 		fprintf(stderr, "BULK-OUT ERROR: received %u byte, expected %lu\n",
-			count, length);
+			(unsigned int)count, length);
 		errno = EPIPE;
 		return -1;
 	}
@@ -1743,6 +2238,21 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 			count = 0;
 			ret = 0;
 			break;
+		case PIMA15740_OP_SEND_OBJECT_INFO:
+			CHECK_COUNT(count, 12, 20, "SEND_OBJECT_INFO");
+			CHECK_SESSION(s_container, r_container, &count, &ret);
+
+			process_send_object_info(recv_buf, send_buf);
+			count = 0;
+			ret = 0;
+			break;
+		case PIMA15740_OP_SEND_OBJECT:
+			CHECK_COUNT(count, 12, 12, "SEND_OBJECT");
+			CHECK_SESSION(s_container, r_container, &count, &ret);
+
+			ret = process_send_object(recv_buf, send_buf);
+			count = 0;
+			break;
 		}
 		break;
 	}
@@ -1752,7 +2262,7 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 			return -1;
 
 		if (verbose)
-			fprintf(stderr, "Unsupported type %lu code %lu\n", type, code);
+			fprintf(stderr, "Unsupported type %lu code 0x%lx\n", type, code);
 		errno = EOPNOTSUPP;
 		make_response(s_container, r_container,
 			      PIMA15740_RESP_OPERATION_NOT_SUPPORTED, sizeof(*s_container));
@@ -2178,7 +2688,20 @@ static size_t put_string(iconv_t ic, char *buf, const char *s, size_t len)
 	ret = iconv(ic, &in, &inl, &buf, &outl);
 	if (inl || outl)
 		fprintf(stdout, "iconv() error %d: %u input / %u output bytes left!\n",
-			errno, inl, outl);
+			errno, (unsigned int)inl, (unsigned int)outl);
+
+	return ret;
+}
+
+static size_t get_string(iconv_t ic, char *buf, const char *s, size_t len)
+{
+	char *in = (char *)s;
+	size_t ret, inl = len * 2, outl = len;
+
+	ret = iconv(ic, &in, &inl, &buf, &outl);
+	if (inl || outl)
+		fprintf(stdout, "iconv() error %d: %u input / %u output bytes left!\n",
+			errno, (unsigned int)inl, (unsigned int)outl);
 
 	return ret;
 }
@@ -2186,8 +2709,7 @@ static size_t put_string(iconv_t ic, char *buf, const char *s, size_t len)
 static int enum_objects(const char *path)
 {
 	struct dirent *dentry;
-	char /*creat[32], creat_ucs2[64], */mod[32], mod_ucs2[64], fname_ucs2[512],
-		thumb[256];
+	char /*creat[32], creat_ucs2[64], */mod[32], mod_ucs2[64], fname_ucs2[512];
 	DIR *d;
 	int ret;
 	struct obj_list **obj = &images;
@@ -2201,11 +2723,12 @@ static int enum_objects(const char *path)
 	d = opendir(".");
 
 	while ((dentry = readdir(d))) {
-		struct stat fstat, tstat;
+		struct stat fstat;
 		char *dot;
 		size_t namelen, datelen, osize;
-		enum pima15740_data_format format;
+		enum pima15740_data_format format, thumb_format;
 		struct tm mod_tm;
+		int thumb_size = 0, thumb_width, thumb_height;
 
 		dot = strrchr(dentry->d_name, '.');
 
@@ -2215,14 +2738,18 @@ static int enum_objects(const char *path)
 		if (strcasecmp(dot, ".tif") &&
 		    strcasecmp(dot, ".tiff") &&
 		    strcasecmp(dot, ".jpg") &&
-		    strcasecmp(dot, ".jpeg"))
+		    strcasecmp(dot, ".jpeg") &&
+		    strcasecmp(dot, ".txt"))
 			continue;
 
 		/* TODO: use identify from ImageMagick and parse its output */
 		switch (dot[1]) {
 		case 't':
 		case 'T':
-			format = PIMA15740_FMT_I_TIFF;
+			if (dot[2] == 'x' || dot[2] == 'X')
+				format = PIMA15740_FMT_A_TEXT;
+			else
+				format = PIMA15740_FMT_I_TIFF;
 			break;
 		case 'j':
 		case 'J':
@@ -2256,36 +2783,12 @@ static int enum_objects(const char *path)
 			datelen = 0;
 		}
 
-		/* Put thumbnails under /var/cache/ptp/thumb/
-		 * and call them <filename>.thumb.<extension> */
-		*dot = '\0';
-		snprintf(thumb, sizeof(thumb), THUMB_LOCATION "%s.thumb.jpeg",
-			 dentry->d_name);
-		*dot = '.';
-		if (stat(thumb, &tstat) < 0 || tstat.st_mtime < fstat.st_mtime) {
-			pid_t converter;
-			if (verbose)
-				fprintf(stderr, "No or old thumbnail for %s\n", dentry->d_name);
-			converter = fork();
-			if (converter < 0) {
-				if (verbose)
-					fprintf(stderr, "Cannot generate thumbnail for %s\n",
-						dentry->d_name);
+		if (format != PIMA15740_FMT_A_TEXT) {
+			thumb_size = generate_thumb(dentry->d_name);
+			if (thumb_size < 0) {
+				thumb_size = 0;
 				continue;
-			} else if (converter) {
-				int status;
-				waitpid(converter, &status, 0);
-				if (!WIFEXITED(status) || WEXITSTATUS(status) ||
-				    stat(thumb, &tstat) < 0) {
-					if (verbose)
-						fprintf(stderr,
-							"Generate thumbnail for %s failed\n",
-							dentry->d_name);
-					continue;
-				}
-			} else
-				execlp("convert", "convert", "-thumbnail", THUMB_SIZE,
-				       dentry->d_name, thumb, NULL);
+			}
 		}
 
 		/* namelen and datelen include terminating '\0', plus 4 string-size bytes */
@@ -2293,12 +2796,24 @@ static int enum_objects(const char *path)
 
 		if (verbose)
 			fprintf(stderr, "Listing image %s, modified %s, info-size %u\n",
-				dentry->d_name, mod, osize);
+				dentry->d_name, mod, (unsigned int)osize);
 
 		*obj = malloc(osize);
 		if (!*obj) {
 			ret = -1;
 			break;
+		}
+
+		if (format == PIMA15740_FMT_A_TEXT ||
+		    format == PIMA15740_FMT_A_UNDEFINED) {
+			thumb_format = PIMA15740_FMT_A_UNDEFINED;
+			thumb_width = 0;
+			thumb_height = 0;
+			thumb_size = 0;
+		} else {
+			thumb_format = PIMA15740_FMT_I_JFIF;
+			thumb_width = THUMB_WIDTH;
+			thumb_height = THUMB_HEIGHT;
 		}
 
 		(*obj)->handle = ++handle;
@@ -2310,10 +2825,10 @@ static int enum_objects(const char *path)
 		(*obj)->info.object_format		= __cpu_to_le16(format);
 		(*obj)->info.protection_status		= __cpu_to_le16(fstat.st_mode & S_IWUSR ? 0 : 1);
 		(*obj)->info.object_compressed_size	= __cpu_to_le32(fstat.st_size);
-		(*obj)->info.thumb_format		= __cpu_to_le16(PIMA15740_FMT_I_JFIF);
-		(*obj)->info.thumb_compressed_size	= __cpu_to_le32(tstat.st_size);
-		(*obj)->info.thumb_pix_width		= __cpu_to_le32(THUMB_WIDTH);
-		(*obj)->info.thumb_pix_height		= __cpu_to_le32(THUMB_HEIGHT);
+		(*obj)->info.thumb_format		= __cpu_to_le16(thumb_format);
+		(*obj)->info.thumb_compressed_size	= __cpu_to_le32(thumb_size);
+		(*obj)->info.thumb_pix_width		= __cpu_to_le32(thumb_width);
+		(*obj)->info.thumb_pix_height		= __cpu_to_le32(thumb_height);
 		(*obj)->info.image_pix_width		= __cpu_to_le32(0);	/* 0 == */
 		(*obj)->info.image_pix_height		= __cpu_to_le32(0);	/* not */
 		(*obj)->info.image_bit_depth		= __cpu_to_le32(0);	/* supported */
@@ -2338,6 +2853,7 @@ static int enum_objects(const char *path)
 	}
 
 	object_number = handle;
+	last_object_number = handle;
 
 	closedir(d);
 	return ret;
@@ -2387,6 +2903,12 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+	uc = iconv_open("ISO8859-1", "UCS-2LE");
+	if (uc == (iconv_t)-1) {
+		perror("iconv_open 2");
+		return -1;
+	}
+
 	init_strings(ic);
 
 	if (init_signal() < 0)
@@ -2429,7 +2951,56 @@ int main(int argc, char *argv[])
 
 	ret = main_loop();
 
+	iconv_close(uc);
 	iconv_close(ic);
 
 	exit(ret ? EXIT_FAILURE : EXIT_SUCCESS);
+}
+
+static int generate_thumb(const char *file_name)
+{
+	struct stat fstat, tstat;
+	char thumb[256];
+	char *dot;
+
+	if (!file_name)
+		return -1;
+
+	dot = strrchr(file_name, '.');
+	if (!dot || dot == file_name)
+		return -1;
+
+	/* Put thumbnails under /var/cache/ptp/thumb/
+	 * and call them <filename>.thumb.<extension> */
+	*dot = '\0';
+	snprintf(thumb, sizeof(thumb), THUMB_LOCATION "%s.thumb.jpeg",
+		 file_name);
+	*dot = '.';
+
+	if (stat(thumb, &tstat) < 0 || tstat.st_mtime < fstat.st_mtime) {
+		pid_t converter;
+		if (verbose)
+			fprintf(stderr, "No or old thumbnail for %s\n", file_name);
+		converter = fork();
+		if (converter < 0) {
+			if (verbose)
+				fprintf(stderr, "Cannot generate thumbnail for %s\n",
+					file_name);
+			return -1;
+		} else if (converter) {
+			int status;
+			waitpid(converter, &status, 0);
+			if (!WIFEXITED(status) || WEXITSTATUS(status) ||
+			    stat(thumb, &tstat) < 0) {
+				if (verbose)
+					fprintf(stderr,
+						"Generate thumbnail for %s failed\n",
+						file_name);
+				return -1;
+			}
+		} else
+			execlp("convert", "convert", "-thumbnail", THUMB_SIZE,
+				       file_name, thumb, NULL);
+	}
+	return tstat.st_size;
 }
