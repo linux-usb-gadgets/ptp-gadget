@@ -1750,7 +1750,8 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 
 	if (info->object_compressed_size > storage_info.free_space_in_bytes) {
 		code = PIMA15740_RESP_STORE_FULL;
-		fprintf(stdout, "no space\n");
+		if (verbose)
+			fprintf(stdout, "no space\n");
 		goto resp;
 	}
 
@@ -1985,8 +1986,8 @@ static int process_send_object(void *recv_buf, void *send_buf)
 		}
 		ret = bulk_read(map + cnt, obj_size - cnt);
 		if (ret < 0) {
-			fprintf(stderr, "%s: reading data for %s failed\n",
-				__func__, object_info_p->name);
+			fprintf(stderr, "%s: reading data for %s failed: %s\n",
+				__func__, object_info_p->name, strerror(errno));
 			code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
 			munmap(map, obj_size);
 			close(fd);
@@ -2706,6 +2707,81 @@ static size_t get_string(iconv_t ic, char *buf, const char *s, size_t len)
 	return ret;
 }
 
+static void clean_up(const char *path)
+{
+	struct dirent *dentry;
+	DIR *d;
+	char file_name[256];
+	int ret;
+
+	ret = chdir(path);
+	if (ret < 0)
+		return;
+
+	d = opendir(".");
+
+	while ((dentry = readdir(d))) {
+		struct stat fstat;
+		char *dot;
+		int lsize, fsize;
+
+		dot = strrchr(dentry->d_name, '.');
+
+		if (!dot || dot == dentry->d_name)
+			continue;
+
+		if (strcasecmp(dot, ".lock"))
+			continue;
+
+		*dot = '\0';
+		snprintf(file_name, sizeof(file_name), "%s", dentry->d_name);
+		*dot = '.';
+
+		ret = stat(dentry->d_name, &fstat);
+		if (ret < 0) {
+			fprintf(stderr, "%s: stat %s: %s\n",
+				__func__, dentry->d_name, strerror(errno));
+			continue;
+		}
+
+		lsize = fstat.st_size;
+
+		ret = stat(file_name, &fstat);
+		if (ret < 0) {
+			fprintf(stderr, "%s: stat %s: %s\n",
+				__func__, file_name, strerror(errno));
+			ret = unlink(dentry->d_name);
+			if (ret < 0)
+				fprintf(stderr, "%s: %s: %s\n",
+					__func__, dentry->d_name,
+					strerror(errno));
+			continue;
+		}
+
+		fsize = fstat.st_size;
+		if (lsize == fsize) {
+			if (verbose)
+				printf("remove %s, %s\n",
+					dentry->d_name, file_name);
+			ret = unlink(dentry->d_name);
+			if (ret < 0)
+				fprintf(stderr, "%s: %s: %s\n",
+					__func__, dentry->d_name, strerror(errno));
+			ret = unlink(file_name);
+			if (ret < 0)
+				fprintf(stderr, "%s: %s: %s\n",
+					__func__, file_name, strerror(errno));
+		} else {
+			if (verbose)
+				printf("remove %s\n", dentry->d_name);
+			ret = unlink(dentry->d_name);
+			if (ret < 0)
+				fprintf(stderr, "%s: %s: %s\n",
+					__func__, dentry->d_name, strerror(errno));
+		}
+	}
+}
+
 static int enum_objects(const char *path)
 {
 	struct dirent *dentry;
@@ -2929,6 +3005,8 @@ int main(int argc, char *argv[])
 	}
 
 	root = argv[argc - 1];
+
+	clean_up(root);
 
 	enum_objects(root);
 
