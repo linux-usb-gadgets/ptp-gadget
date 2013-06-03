@@ -1918,11 +1918,51 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 	return bulk_write(s_container, length);
 }
 
+static void cleanup_endpoint(int ep_fd, char *ep_name)
+{
+	int ret;
+
+	if(ep_fd < 0)
+		return;
+
+	ret = ioctl(ep_fd, FUNCTIONFS_FIFO_STATUS);
+	if(ret < 0)
+	{
+		//ENODEV reported after disconnect
+		if(errno != ENODEV)
+			fprintf(stderr, "%s, %s: get fifo status(%s): %s \n", __FILE__, __FUNCTION__, ep_name, strerror(errno));
+	}
+	else if(ret)
+	{
+		if (verbose)
+			fprintf(stderr, "%s, %s: %s: unclaimed = %d \n", __FILE__, __FUNCTION__, ep_name, ret);
+		if(ioctl(ep_fd, FUNCTIONFS_FIFO_FLUSH) < 0)
+			fprintf(stderr, "%s, %s: %s: fifo flush \n", __FILE__, __FUNCTION__, ep_name);
+	}
+
+	if(close(ep_fd) < 0)
+		fprintf(stderr, "%s, %s: %s: close \n", __FILE__, __FUNCTION__, ep_name);
+}
+
+/*
+ * communication thread cleanup actions
+ */
+static void cleanup_bulk_thread(void *arg)
+{
+	(void) arg;
+
+	cleanup_endpoint(bulk_out, "out");
+	cleanup_endpoint(bulk_in, "in");
+	cleanup_endpoint(interrupt, "interrupt");
+}
+
 static void *bulk_thread(void *param)
 {
 	void *recv_buf, *send_buf;
 	int ret;
 	size_t s_size = BUF_SIZE, r_size = BUF_SIZE;
+
+	pthread_cleanup_push(cleanup_bulk_thread, NULL);
 
 	recv_buf = malloc(BUF_SIZE);
 	send_buf = malloc(BUF_SIZE);
@@ -1944,6 +1984,7 @@ static void *bulk_thread(void *param)
 		pthread_testcancel();
 	} while (ret >= 0);
 
+	pthread_cleanup_pop(1);
 done:
 	free(recv_buf);
 	free(send_buf);
