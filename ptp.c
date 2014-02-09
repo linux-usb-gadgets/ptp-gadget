@@ -70,6 +70,9 @@ static int verbose;
 #define THUMB_SUPPORT
 #undef THUMB_SUPPORT
 
+#define FORMAT_SUPPORT
+#undef  FORMAT_SUPPORT
+
 /*-------------------------------------------------------------------------*/
 
 /* USB subclass value = the protocol encapsulation */
@@ -360,6 +363,7 @@ static uint16_t dummy_supported_operations[] = {
 	SUPPORTED_OPERATIONS
 };
 
+#ifdef FORMAT_SUPPORT
 #define SUPPORTED_FORMATS					\
 	__constant_cpu_to_le16(PIMA15740_FMT_A_UNDEFINED),	\
 	__constant_cpu_to_le16(PIMA15740_FMT_A_TEXT),		\
@@ -369,6 +373,10 @@ static uint16_t dummy_supported_operations[] = {
 	__constant_cpu_to_le16(PIMA15740_FMT_I_TIFF),		\
 	__constant_cpu_to_le16(PIMA15740_FMT_I_TIFF_IT),	\
 	__constant_cpu_to_le16(PIMA15740_FMT_I_JFIF),
+#else
+#define SUPPORTED_FORMATS					\
+	__constant_cpu_to_le16(PIMA15740_FMT_A_UNDEFINED),
+#endif
 
 static uint16_t dummy_supported_formats[] = {
 	SUPPORTED_FORMATS
@@ -2479,6 +2487,9 @@ static int enum_objects(const char *path)
 		if (!dot || dot == dentry->d_name || !strncmp(dentry->d_name, "..", 2))
 			continue;
 
+	format = PIMA15740_FMT_A_UNDEFINED;
+
+#ifdef FORMAT_SUPPORT
 		/* TODO: use identify from ImageMagick and parse its output */
 		switch (dot[1]) {
 		case 't':
@@ -2495,6 +2506,7 @@ static int enum_objects(const char *path)
 		default:
 			format = PIMA15740_FMT_A_UNDEFINED;
 		}
+#endif
 
 		ret = stat(dentry->d_name, &fstat);
 		if (ret < 0)
