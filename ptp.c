@@ -457,6 +457,7 @@ static sem_t reset;
 
 static iconv_t ic, uc;
 static char *root;
+static char *lockdir = "/tmp";
 
 #define	NEVENT		5
 
@@ -1314,6 +1315,11 @@ static int read_container(void *recv_buf, size_t recv_size)
 	return count;
 }
 
+static void get_lock_filename(char *fname, size_t fname_size, char *objname)
+{
+	snprintf(fname, fname_size, "%s/%.250s.lock", lockdir, objname);
+}
+
 static int process_send_object_info(void *recv_buf, void *send_buf)
 {
 	struct ptp_container *r_container = recv_buf;
@@ -1322,7 +1328,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	struct ptp_object_info *info;
 	uint32_t *param, p1, p2;
 	size_t new_info_size, alloc_size;
-	char lock_file[256];
+	char lock_file[1024];
 	char new_file[256];
 	mode_t mode;
 	int fd, fd_new;
@@ -1400,17 +1406,8 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 
 	if (object_info_p) {
 		/* replace previously allocated info, free resources */
-		int len;
-		char c;
 
-		len = strlen(object_info_p->name);
-		if (len > 250) {
-			c = object_info_p->name[250];
-			object_info_p->name[250] = '\0';
-		}
-		snprintf(lock_file, 256, "%s.lock", object_info_p->name);
-		if (len > 250)
-			object_info_p->name[250] = c;
+		get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
 
 		ret = unlink(lock_file);
 		if (ret < 0)
@@ -1441,7 +1438,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 		goto err;
 	}
 
-	snprintf(lock_file, 255, "%s.lock", new_file);
+	get_lock_filename(lock_file, sizeof(lock_file), new_file);
 
 	mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 	if (info->protection_status & 0x0001)
@@ -1559,9 +1556,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 	void *map;
 	int offset = sizeof(*r_container);
 	int fd, cnt = 0, obj_size, ret;
-	char lock_file[256];
-	int len;
-	char c;
+	char lock_file[1024];
 
 	/* start reading data phase */
 	ret = read_container(recv_buf, BUF_SIZE);
@@ -1683,14 +1678,7 @@ link:
 	object_info_p->next = 0;
 	images = g_slist_append(images, object_info_p);
 
-	len = strlen(object_info_p->name);
-	if (len > 250) {
-		c = object_info_p->name[250];
-		object_info_p->name[250] = '\0';
-	}
-	snprintf(lock_file, 250, "%s.lock", object_info_p->name);
-	if (len > 250)
-		object_info_p->name[250] = c;
+	get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
 
 	ret = unlink(lock_file);
 	if (ret < 0)
@@ -2678,10 +2666,13 @@ int main(int argc, char *argv[])
 	if (sem_init(&reset, 0, 0) < 0)
 		exit(EXIT_FAILURE);
 
-	while ((c = getopt(argc, argv, "v")) != EOF) {
+	while ((c = getopt(argc, argv, "vl:")) != EOF) {
 		switch (c) {
 		case 'v':
 			verbose++;
+			break;
+		case 'l':
+			lockdir = optarg;
 			break;
 		default:
 			fprintf(stderr, "Unsupported option %c\n", c);
@@ -2691,7 +2682,7 @@ int main(int argc, char *argv[])
 
 	root = argv[argc - 1];
 
-	clean_up(root);
+	clean_up(lockdir);
 
 	/*
 	 * if a client doesn't ask for storage info (as seen with some
