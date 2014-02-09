@@ -552,24 +552,6 @@ struct ptp_object_info {
 	uint8_t		strings[];
 } __attribute__ ((packed));
 
-static struct ptp_object_info association = {
-	.storage_id		= __constant_cpu_to_le32(STORE_ID),
-	.object_format		= __constant_cpu_to_le16(PIMA15740_FMT_A_ASSOCIATION),
-	.protection_status	= __constant_cpu_to_le16(0),	/* Read-only */
-	.object_compressed_size	= __constant_cpu_to_le32(4096),
-	.thumb_format		= __constant_cpu_to_le16(0),
-	.thumb_compressed_size	= __constant_cpu_to_le32(0),
-	.thumb_pix_width	= __constant_cpu_to_le32(0),
-	.thumb_pix_height	= __constant_cpu_to_le32(0),
-	.image_pix_width	= __constant_cpu_to_le32(0),
-	.image_pix_height	= __constant_cpu_to_le32(0),
-	.image_bit_depth	= __constant_cpu_to_le32(0),
-	.parent_object		= __constant_cpu_to_le32(0),	/* Will be overwritten */
-	.association_type	= __constant_cpu_to_le16(1),	/* Generic Folder */
-	.association_desc	= __constant_cpu_to_le32(0),
-	.sequence_number	= __constant_cpu_to_le32(0),
-};
-
 struct obj_list {
 	struct obj_list		*next;
 	uint32_t		handle;
@@ -595,10 +577,6 @@ static int object_handle_valid(unsigned int h)
 {
 	struct obj_list *obj;
 	GSList *iterator;
-
-	/* First two handles: dcim and PTP_MODEL_DIR */
-	if (h == 1 || h == 2)
-		return 1;
 
 	GFOREACH(obj, images) {
 		if (obj->handle == h)
@@ -705,21 +683,6 @@ static int send_event(enum pima15740_event_code code, unsigned int param1) {
 	return interrupt_write(&event, len);
 }
 
-static int send_association_handle(int n, struct ptp_container *s)
-{
-	uint32_t *handle;
-
-	s->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
-	/* One array element */
-	*(uint32_t *)s->payload = __cpu_to_le32(1);
-	s->length = __cpu_to_le32(2 * sizeof(uint32_t) + sizeof(*s));
-
-	handle = (uint32_t *)s->payload + 1;
-	/* The next directory */
-	*handle = __cpu_to_le32(n);
-	return bulk_write(s, (void *)(handle + 1) - (void *)s);
-}
-
 static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 {
 	struct ptp_container *r_container = recv_buf;
@@ -731,8 +694,8 @@ static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 	GSList *iterator = NULL;
 	int ret;
 	uint32_t *handle;
-	uint32_t format, association;
-	int obj_to_send = g_slist_length(images) + 2;
+	uint32_t format;
+	int obj_to_send = g_slist_length(images);
 
 	length	= __le32_to_cpu(r_container->length);
 
@@ -754,50 +717,12 @@ static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 		return 0;
 	}
 
-	association = __le32_to_cpu(*(param + 2));
-	if (length > 20 && association != PTP_PARAM_UNUSED && association != 2) {
-		enum pima15740_response_code code;
-		if (!object_handle_valid(association) && association != PTP_PARAM_ANY)
-			code = PIMA15740_RESP_INVALID_OBJECT_HANDLE;
-		else if (association == PTP_PARAM_ANY) {
-			/* "/" is requested */
-			ret = send_association_handle(1, s_container);
-			if (ret < 0) {
-				errno = EPIPE;
-				return ret;
-			} else
-				code = PIMA15740_RESP_OK;
-		} else if (association == 1) {
-			/* The subdirectory of "/DCIM" is requested */
-			ret = send_association_handle(2, s_container);
-			if (ret < 0) {
-				errno = EPIPE;
-				return ret;
-			} else
-				code = PIMA15740_RESP_OK;
-		} else
-			code = PIMA15740_RESP_INVALID_PARENT_OBJECT;
-
-		make_response(s_container, r_container, code, sizeof(*s_container));
-		return 0;
-	}
-
-	if (association == 2)
-		/* Only send contents of /DCIM/100LINUX */
-		obj_to_send -= 2;
-
 	s_container->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
 	*(uint32_t *)s_container->payload = __cpu_to_le32(obj_to_send);
 	s_container->length = __cpu_to_le32((obj_to_send + 1) * sizeof(uint32_t) +
 					    sizeof(*s_container));
 
 	handle = (uint32_t *)s_container->payload + 1;
-
-	if (association != 2) {
-		/* The two directories */
-		*handle++ = __cpu_to_le32(1);
-		*handle++ = __cpu_to_le32(2);
-	}
 
 	GFOREACH(obj, images) {
 		if ((void *)handle == send_buf + send_len) {
@@ -825,39 +750,6 @@ static int send_object_handles(void *recv_buf, void *send_buf, size_t send_len)
 	return 0;
 }
 
-static int send_association(int n, struct ptp_container *s, size_t size)
-{
-	struct ptp_object_info *objinfo = (struct ptp_object_info *)s->payload;
-	size_t len, total;
-	int ret = -1;
-
-	s->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
-	memcpy(objinfo, &association, sizeof(association));
-	objinfo->object_compressed_size = __cpu_to_le32(size);
-	switch (n) {
-	case 1:
-		len = strlen("DCIM") + 1;
-		ret = put_string(ic, (char *)objinfo->strings + 1, "DCIM", len);
-		objinfo->parent_object = __cpu_to_le32(0);
-		break;
-	case 2:
-		len = strlen(PTP_MODEL_DIR) + 1;
-		ret = put_string(ic, (char *)objinfo->strings + 1, PTP_MODEL_DIR, len);
-		objinfo->parent_object = __cpu_to_le32(1);
-		break;
-	}
-	if (ret < 0)
-		return ret;
-	objinfo->strings[0] = len;
-	objinfo->strings[2 * len + 1] = 0;	/* Empty Capture Date */
-	objinfo->strings[2 * len + 2] = 0;	/* Empty Modification Date */
-	objinfo->strings[2 * len + 3] = 0;	/* Empty Keywords */
-	total = 2 * len + 4 + sizeof(*s) + sizeof(*objinfo);
-	s->length = __cpu_to_le32(total);
-
-	return bulk_write(s, total);
-}
-
 static int send_object_info(void *recv_buf, void *send_buf, size_t send_len)
 {
 	struct ptp_container *r_container = recv_buf;
@@ -873,31 +765,6 @@ static int send_object_info(void *recv_buf, void *send_buf, size_t send_len)
 
 	param = (uint32_t *)r_container->payload;
 	handle = __le32_to_cpu(*param);
-
-	if (handle == 1 || handle == 2) {
-		struct stat dstat;
-		size_t size;
-
-		/* Directory information requested */
-		if (handle == 2) {
-			ret = stat(root, &dstat);
-			if (ret < 0) {
-				errno = EPIPE;
-				return ret;
-			}
-			size = dstat.st_size;
-			if (verbose > 1)
-				fprintf(stderr, "%s size %u\n", root, (unsigned int)size);
-		} else
-			size = 4096;
-		ret = send_association(handle, s_container, size);
-		if (ret < 0) {
-			errno = EPIPE;
-			return ret;
-		}
-
-		goto send_resp;
-	}
 
 	GFOREACH(obj, images) {
 		if (obj->handle == handle)
@@ -1320,10 +1187,6 @@ static void delete_object(void *recv_buf, void *send_buf)
 		/* ObjectFormatCode not supported */
 		code = PIMA15740_RESP_SPECIFICATION_BY_FORMAT_NOT_SUPPORTED;
 		goto resp;
-	} else if (handle == 1 || handle == 2) {
-		/* read-only /DCIM and /DCIM/100LINUX */
-		code = PIMA15740_RESP_OBJECT_WRITE_PROTECTED;
-		goto resp;
 	}
 
 	ret = chdir(root);
@@ -1336,7 +1199,7 @@ static void delete_object(void *recv_buf, void *send_buf)
 	if (handle == PTP_PARAM_ANY) {
 		int partial = 0;
 
-		if (!g_slist_length(images) + 2) {
+		if (!g_slist_length(images)) {
 			code = PIMA15740_RESP_OK;
 			goto resp;
 		}
@@ -1445,7 +1308,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 		code = PIMA15740_RESP_INVALID_STORAGE_ID;
 		goto resp;
 	}
-	if (p2 != 2) {
+	if (p2 != PTP_PARAM_ANY) {
 		code = PIMA15740_RESP_SPECIFICATION_OF_DESTINATION_UNSUPPORTED;
 		goto resp;
 	}
@@ -1600,14 +1463,14 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	object_info_p->handle			= ++last_object_number;
 	object_info_p->info_size		= new_info_size;
 	object_info_p->info.storage_id		= __cpu_to_le32(STORE_ID);
-	object_info_p->info.parent_object	= __cpu_to_le32(2);	/* Fixed /dcim/xxx/ */
+	object_info_p->info.parent_object	= __cpu_to_le32(0);	/* Fixed / */
 	object_info_p->info.association_type	= __cpu_to_le16(0);
 	object_info_p->info.association_desc	= __cpu_to_le32(0);
 	object_info_p->info.sequence_number	= __cpu_to_le32(0);
 
 	param = (uint32_t *)&s_container->payload[0];
 	param[0] = __cpu_to_le32(STORE_ID);
-	param[1] = __cpu_to_le32(2);
+	param[1] = __cpu_to_le32(0);
 	param[2] = __cpu_to_le32(last_object_number);
 
 	close(fd);
@@ -1955,13 +1818,8 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 			else if (count > 20 && p3 != PTP_PARAM_UNUSED) {
 				if (!object_handle_valid(p3))
 					code = PIMA15740_RESP_INVALID_OBJECT_HANDLE;
-				else if (p3 == PTP_PARAM_ANY || p3 == 1) {
-					/* root or DCIM - report one handle */
-					code = PIMA15740_RESP_OK;
-					ret += sizeof(*param);
-					*param = __cpu_to_le32(1);
-				} else if (p3 == 2) {
-					/* Contents of 100LINUX */
+				else if (p3 == PTP_PARAM_ANY) {
+					/* Content of directory */
 					code = PIMA15740_RESP_OK;
 					ret += sizeof(*param);
 					*param = __cpu_to_le32(g_slist_length(images));
@@ -1971,7 +1829,7 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 				/* No parent Association specified or 0 */
 				code = PIMA15740_RESP_OK;
 				ret += sizeof(*param);
-				*param = __cpu_to_le32(g_slist_length(images) + 2);
+				*param = __cpu_to_le32(g_slist_length(images));
 			}
 			make_response(s_container, r_container, code, ret);
 			count = 0;
@@ -2684,13 +2542,13 @@ static int add_object(char *filename) {
 
 	dot = strrchr(filename, '.');
 
-	if (!dot || dot == filename || !strncmp(filename, "..", 2))
+	if (dot == filename || !strncmp(filename, "..", 2))
 		return 0;
 
 	format = PIMA15740_FMT_A_UNDEFINED;
 
 #ifdef FORMAT_SUPPORT
-	{
+	if (dot && strlen(dot) >= 3) {
 		/* TODO: use identify from ImageMagick and parse its output */
 		switch (dot[1]) {
 		case 't':
@@ -2713,6 +2571,9 @@ static int add_object(char *filename) {
 	ret = stat(filename, &fstat);
 	if (ret < 0)
 		return ret;
+
+	if (fstat.st_mode & S_IFDIR)
+		return 0;
 
 	namelen = strlen(filename) + 1;
 
@@ -2795,7 +2656,7 @@ static int add_object(char *filename) {
 	obj->info.image_pix_width = __cpu_to_le32(0); /* 0 == */
 	obj->info.image_pix_height = __cpu_to_le32(0); /* not */
 	obj->info.image_bit_depth = __cpu_to_le32(0); /* supported */
-	obj->info.parent_object = __cpu_to_le32(2); /* Fixed /dcim/xxx/ */
+	obj->info.parent_object = __cpu_to_le32(0); /* Fixed / */
 	obj->info.association_type = __cpu_to_le16(0);
 	obj->info.association_desc = __cpu_to_le32(0);
 	obj->info.sequence_number = __cpu_to_le32(0);
@@ -2826,9 +2687,6 @@ static int enum_objects(const char *path) {
 		return ret;
 
 	d = opendir(".");
-
-	/* First two handles used for /DCIM/PTP_MODEL_DIR */
-	last_object_number = 2;
 
 	while ((dentry = readdir(d))) {
 		ret = add_object(dentry->d_name);
