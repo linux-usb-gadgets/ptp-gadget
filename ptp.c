@@ -29,6 +29,7 @@
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
+#include <sys/inotify.h>
 
 #include <asm/byteorder.h>
 
@@ -82,7 +83,11 @@ static int verbose;
 #define MAX_PACKET_SIZE_HS 512
 
 /* some devices can handle other status packet sizes */
-#define STATUS_MAXPACKET	8
+
+/* ATTENTION: somehow automatic ZLP generation is not working.
+ * make sure that event length, which is 24, is not a multiple of STATUS_MAXPACKET
+ */
+#define STATUS_MAXPACKET	28
 
 static const struct
 {
@@ -306,6 +311,24 @@ enum pima15740_response_code {
 	PIMA15740_RESP_SPECIFICATION_OF_DESTINATION_UNSUPPORTED	= 0x2020,
 };
 
+enum pima15740_event_code {
+	PIMA15740_EVENT_UNDEFINED		= 0x4000,
+	PIMA15740_EVENT_CANCEL_TRANSACTION	= 0x4001,
+	PIMA15740_EVENT_OBJECT_ADDED		= 0x4002,
+	PIMA15740_EVENT_OBJECT_REMOVED		= 0x4003,
+	PIMA15740_EVENT_STORE_ADDED		= 0x4004,
+	PIMA15740_EVENT_STORE_REMOVED		= 0x4005,
+	PIMA15740_EVENT_DEVICE_PROP_CHANGED	= 0x4006,
+	PIMA15740_EVENT_OBJECT_INFO_CHANGED	= 0x4007,
+	PIMA15740_EVENT_DEVICE_INFO_CHANGED	= 0x4008,
+	PIMA15740_EVENT_REQUEST_OBJECT_TRANSFER = 0x4009,
+	PIMA15740_EVENT_STORE_FULL		= 0x400a,
+	PIMA15740_EVENT_DEVICE_RESET		= 0x400b,
+	PIMA15740_EVENT_STORAGE_INFO_CHANGED	= 0x400c,
+	PIMA15740_EVENT_CAPTURE_COMPLETE	= 0x400d,
+	PIMA15740_EVENT_UNREPORTED_STATUS	= 0x400e,
+};
+
 enum pima15740_data_format {
 	PIMA15740_FMT_A_UNDEFINED		= 0x3000,
 	PIMA15740_FMT_A_ASSOCIATION		= 0x3001,
@@ -382,6 +405,15 @@ static uint16_t dummy_supported_formats[] = {
 	SUPPORTED_FORMATS
 };
 
+#define SUPPORTED_EVENTS						\
+	__constant_cpu_to_le16(PIMA15740_EVENT_OBJECT_ADDED),		\
+	__constant_cpu_to_le16(PIMA15740_EVENT_OBJECT_REMOVED),		\
+	__constant_cpu_to_le16(PIMA15740_EVENT_OBJECT_INFO_CHANGED),
+
+static uint16_t dummy_supported_events[] = {
+	SUPPORTED_EVENTS
+};
+
 struct my_device_info {
 	uint16_t	std_ver;
 	uint32_t	vendor_ext_id;
@@ -391,6 +423,7 @@ struct my_device_info {
 	uint32_t	operations_n;
 	uint16_t	operations[ARRAY_SIZE(dummy_supported_operations)];
 	uint32_t	events_n;
+	uint16_t	events[ARRAY_SIZE(dummy_supported_events)];
 	uint32_t	device_properties_n;
 	uint32_t	capture_formats_n;
 	uint32_t	image_formats_n;
@@ -413,7 +446,10 @@ struct my_device_info dev_info = {
 	.operations = {
 		SUPPORTED_OPERATIONS
 	},
-	.events_n		= __constant_cpu_to_le32(0),
+	.events_n		= __constant_cpu_to_le32(ARRAY_SIZE(dummy_supported_events)),
+	.events = {
+		SUPPORTED_EVENTS
+	},
 	.device_properties_n	= __constant_cpu_to_le32(0),
 	.capture_formats_n	= __constant_cpu_to_le32(0),
 	.image_formats_n	= __constant_cpu_to_le32(ARRAY_SIZE(dummy_supported_formats)),
@@ -453,7 +489,9 @@ static int bulk_out = -ENXIO;
 static int control = -ENXIO;
 static int interrupt = -ENXIO;
 static int session = -EINVAL;
+static int notify_fd = -ENXIO;
 static sem_t reset;
+static sem_t dbaccess;
 
 static iconv_t ic, uc;
 static char *root;
@@ -472,6 +510,7 @@ enum ptp_status {
 static enum ptp_status status = PTP_WAITCONFIG;
 
 static pthread_t bulk_pthread;
+static pthread_t inotify_pthread;
 
 #define __stringify_1(x)	#x
 #define __stringify(x)		__stringify_1(x)
@@ -483,6 +522,16 @@ static pthread_t bulk_pthread;
 #define THUMB_SIZE	__stringify(THUMB_WIDTH) "x" __stringify(THUMB_HEIGHT)
 #define THUMB_LOCATION    "/var/cache/ptp/thumb/"
 #endif
+
+struct ptp_event_container {
+	uint32_t	length;
+	uint16_t	type;
+	uint16_t	event_code;
+	uint32_t	transaction_id;
+	uint32_t	parameter1;
+	uint32_t	parameter2;
+	uint32_t	parameter3;
+} __attribute__ ((packed));
 
 struct ptp_object_info {
 	uint32_t	storage_id;
@@ -533,13 +582,14 @@ struct obj_list {
 
 static GSList *images;
 /* number of objects, including associations - decrement when deleting */
-static int object_number;
 static int last_object_number;
 
 static struct obj_list *object_info_p;
 
 static size_t put_string(iconv_t ic, char *buf, const char *s, size_t len);
 static size_t get_string(iconv_t ic, char *buf, const char *s, size_t len);
+
+static void inotify_sync();
 
 static int object_handle_valid(unsigned int h)
 {
@@ -613,6 +663,46 @@ static int bulk_read(void *buf, size_t length)
 		fprintf(stderr, "BULK-OUT Read %u bytes\n", (unsigned int)count);
 
 	return count;
+}
+
+static int interrupt_write(void *buf, size_t length) {
+	size_t count = 0;
+	int ret;
+
+	do {
+		ret = write(interrupt, buf + count, length - count);
+		if (ret < 0) {
+			if (errno != EINTR)
+				return ret;
+
+			/* Need to wait for control thread to finish reset */
+			sem_wait(&reset);
+		} else
+			count += ret;
+	} while (count < length);
+
+	if (verbose)
+		fprintf(stderr, "INTERRUPT sent %u bytes\n", (unsigned int) count);
+
+	return count;
+}
+
+static int send_event(enum pima15740_event_code code, unsigned int param1) {
+	struct ptp_event_container event;
+	int len = 12 + 3 * 4; /* 12 + parameters*4 */
+
+	event.length = __cpu_to_le32(len);
+	event.type = __cpu_to_le16(PTP_CONTAINER_TYPE_EVENT_BLOCK);
+	event.event_code = __cpu_to_le16(code);
+	event.transaction_id = __cpu_to_le32(0);
+	event.parameter1 = __cpu_to_le32(param1);
+	event.parameter2 = __cpu_to_le32(0);
+	event.parameter3 = __cpu_to_le32(0);
+
+	if (verbose)
+		fprintf(stderr, "sending event, code: 0x%04X, parameter1: 0x%08X\n", code, param1);
+
+	return interrupt_write(&event, len);
 }
 
 static int send_association_handle(int n, struct ptp_container *s)
@@ -1109,7 +1199,7 @@ static void dump_obj(const char *s)
 	struct obj_list *obj;
 	GSList *iterator;
 
-	printf("%s, object_number %d\n", s, object_number);
+	printf("%s\n", s);
 
 	GFOREACH(obj, images) {
 		printf("obj: 0x%p, next 0x%p, handle %u, name %s\n",
@@ -1407,8 +1497,9 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	if (object_info_p) {
 		/* replace previously allocated info, free resources */
 
-		get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
+		inotify_sync();
 
+		get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
 		ret = unlink(lock_file);
 		if (ret < 0)
 			fprintf(stderr, "can't remove %s: %s",
@@ -1471,6 +1562,9 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 			code = PIMA15740_RESP_GENERAL_ERROR;
 
 		close(fd);
+
+		inotify_sync();
+
 		ret = unlink(lock_file);
 		if (ret < 0)
 			perror ("can't remove lock file");
@@ -1531,6 +1625,8 @@ err_del:
 	if (ret < 0)
 		fprintf(stderr, "can't remove %s: %s\n",
 			new_file, strerror(errno));
+
+	inotify_sync();
 
 	ret = unlink(lock_file);
 	if (ret < 0)
@@ -1678,14 +1774,14 @@ link:
 	object_info_p->next = 0;
 	images = g_slist_append(images, object_info_p);
 
-	get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
+	inotify_sync();
 
+	get_lock_filename(lock_file, sizeof(lock_file), object_info_p->name);
 	ret = unlink(lock_file);
 	if (ret < 0)
 		fprintf(stderr, "can't remove %s: %s",
 			lock_file, strerror(errno));
 
-	object_number++;
 	object_info_p = 0;
 #ifdef DEBUG
 	dump_obj("after link");
@@ -1745,6 +1841,8 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 
 	ret = -1;
 
+	sem_wait(&dbaccess);
+
 	switch (type) {
 	case PTP_CONTAINER_TYPE_COMMAND_BLOCK:
 		switch (code) {
@@ -1760,8 +1858,10 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 			s_container->length = __cpu_to_le32(count);
 			memcpy(send_buf + sizeof(*s_container), &dev_info, sizeof(dev_info));
 			ret = bulk_write(s_container, count);
-			if (ret < 0)
+			if (ret < 0) {
+				sem_post(&dbaccess);
 				return ret;
+			}
 
 			/* Second part: response block */
 			s_container = send_buf + count;
@@ -1910,6 +2010,8 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 		break;
 	}
 
+	sem_post(&dbaccess);
+
 	if (ret < 0) {
 		if (errno == EPIPE)
 			return -1;
@@ -1999,6 +2101,125 @@ static void *bulk_thread(void *param)
 done:
 	free(recv_buf);
 	free(send_buf);
+	pthread_exit(NULL);
+}
+
+static int add_object(char *filename);
+
+/*
+ * Since functionfs unfortunately neither support select/poll operations nor nonblocking i/o
+ * we need to split end point handling and inotify processing into separate threads.
+ * Nevertheless sometime it's important to ensure a specific processing order.
+ * Calling this helper will ensure that all inotify events, existing at this moment, will be processed before continuing.
+ */
+static void inotify_sync() {
+	int ret;
+	fd_set fds;
+	struct timeval timeout;
+
+	do {
+		FD_ZERO(&fds);
+		FD_SET(notify_fd, &fds);
+
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 0;
+		ret = select(notify_fd + 1, &fds, NULL, NULL, &timeout);
+	} while (ret > 0 && FD_ISSET(notify_fd, &fds));
+}
+
+#define INOTIFY_EVENT_SIZE  ( sizeof(struct inotify_event) )
+#define INOTIFY_EVENT_BUF   ( INOTIFY_EVENT_SIZE + NAME_MAX + 1 )
+
+static void *inotify_thread(void *param) {
+	char buffer[16 * INOTIFY_EVENT_BUF];
+	int i, length;
+	(void) param;
+
+	do {
+		length = read(notify_fd, buffer, sizeof(buffer));
+
+		if (length < 0)
+			fprintf(stderr, "inotify read: %s\n", strerror(errno));
+
+		i = 0;
+		/* actually read return the list of change events happens. Here, read the change event one by one and process it accordingly. */
+		while (i < length) {
+			struct inotify_event *event = (struct inotify_event *) &buffer[i];
+			if (event->len) {
+				char lock_file[1024];
+				struct stat lockstat;
+
+				/* ignore events for files when a related lock file exists */
+				get_lock_filename (lock_file, sizeof(lock_file), event->name);
+				if(stat(lock_file, &lockstat) == 0) {
+					i += INOTIFY_EVENT_SIZE + event->len;
+					continue;
+				}
+
+				sem_wait(&dbaccess);
+				if (event->mask & IN_CLOSE_WRITE) {
+					struct obj_list *obj = NULL;
+					GSList *iterator;
+
+					if (verbose)
+						fprintf(stderr, "inotify: file %s closed\n", event->name);
+
+					/* test if file is already in database */
+					GFOREACH(obj, images) {
+						if (strcmp(obj->name, event->name) == 0)
+							break;
+					}
+
+					if (obj) {
+						if (verbose)
+							fprintf(stderr, "inotify: closed file %s already in database, delete it first\n", event->name);
+						delete_thumb(obj);
+						images = g_slist_remove(images, obj);
+						update_free_space();
+						send_event(PIMA15740_EVENT_OBJECT_REMOVED, obj->handle);
+						free(obj);
+					}
+
+					update_free_space();
+
+					if (add_object(event->name) >= 0) {
+						if (verbose)
+							fprintf(stderr, "inotify: added file %s\n", event->name);
+						send_event(PIMA15740_EVENT_OBJECT_ADDED, last_object_number);
+					}
+
+				} else if (event->mask & IN_DELETE) {
+					struct obj_list *obj = NULL;
+					GSList *iterator;
+
+					if (verbose)
+						fprintf(stderr, "inotify: file %s deleted\n", event->name);
+
+					GFOREACH(obj, images) {
+						if (strcmp(obj->name, event->name) == 0)
+							break;
+					}
+
+					if (obj) {
+						if (verbose)
+							fprintf(stderr, "inotify: deleting file %s\n", obj->name);
+						delete_thumb(obj);
+						images = g_slist_remove(images, obj);
+						update_free_space();
+						send_event(PIMA15740_EVENT_OBJECT_REMOVED, obj->handle);
+						free(obj);
+					} else
+						update_free_space();
+
+				}
+				sem_post(&dbaccess);
+			}
+			i += INOTIFY_EVENT_SIZE + event->len;
+		}
+
+		pthread_testcancel();
+	} while (length >= 0);
+
 	pthread_exit(NULL);
 }
 
@@ -2446,38 +2667,30 @@ static void clean_up(const char *path)
 	closedir(d);
 }
 
-static int enum_objects(const char *path)
-{
-	struct dirent *dentry;
-	char /*creat[32], creat_ucs2[64], */mod[32], mod_ucs2[64], fname_ucs2[512];
-	DIR *d;
+static int add_object(char *filename) {
+	struct stat fstat;
+	size_t namelen, datelen, osize;
+	enum pima15740_data_format format, thumb_format;
+	char *dot;
+	struct tm mod_tm;
+	int thumb_size = 0, thumb_width, thumb_height;
+	char mod[32], mod_ucs2[64], fname_ucs2[512];
 	int ret;
 	struct obj_list *obj;
-	/* First two handles used for /DCIM/PTP_MODEL_DIR */
-	uint32_t handle = 2;
 
-	ret = chdir(path);
+	ret = chdir(root);
 	if (ret < 0)
 		return ret;
 
-	d = opendir(".");
+	dot = strrchr(filename, '.');
 
-	while ((dentry = readdir(d))) {
-		struct stat fstat;
-		char *dot;
-		size_t namelen, datelen, osize;
-		enum pima15740_data_format format, thumb_format;
-		struct tm mod_tm;
-		int thumb_size = 0, thumb_width, thumb_height;
-
-		dot = strrchr(dentry->d_name, '.');
-
-		if (!dot || dot == dentry->d_name || !strncmp(dentry->d_name, "..", 2))
-			continue;
+	if (!dot || dot == filename || !strncmp(filename, "..", 2))
+		return 0;
 
 	format = PIMA15740_FMT_A_UNDEFINED;
 
 #ifdef FORMAT_SUPPORT
+	{
 		/* TODO: use identify from ImageMagick and parse its output */
 		switch (dot[1]) {
 		case 't':
@@ -2494,111 +2707,134 @@ static int enum_objects(const char *path)
 		default:
 			format = PIMA15740_FMT_A_UNDEFINED;
 		}
+	}
 #endif
 
-		ret = stat(dentry->d_name, &fstat);
-		if (ret < 0)
-			break;
+	ret = stat(filename, &fstat);
+	if (ret < 0)
+		return ret;
 
-		namelen = strlen(dentry->d_name) + 1;
+	namelen = strlen(filename) + 1;
 
-		ret = put_string(ic, fname_ucs2, dentry->d_name, namelen);
-		if (ret)
-			break;
+	ret = put_string(ic, fname_ucs2, filename, namelen);
+	if (ret)
+		return ret;
 
-		gmtime_r(&fstat.st_mtime, &mod_tm);
-		snprintf(mod, sizeof(mod),"%04u%02u%02uT%02u%02u%02u.0Z",
-			 mod_tm.tm_year + 1900, mod_tm.tm_mon + 1,
-			 mod_tm.tm_mday, mod_tm.tm_hour,
-			 mod_tm.tm_min, mod_tm.tm_sec);
+	gmtime_r(&fstat.st_mtime, &mod_tm);
+	snprintf(mod, sizeof(mod), "%04u%02u%02uT%02u%02u%02u.0Z", mod_tm.tm_year
+			+ 1900, mod_tm.tm_mon + 1, mod_tm.tm_mday, mod_tm.tm_hour,
+			mod_tm.tm_min, mod_tm.tm_sec);
 
-		/* String length including the trailing '\0' */
-		datelen = strlen(mod) + 1;
-		ret = put_string(ic, mod_ucs2, mod, datelen);
-		if (ret) {
-			mod[0] = '\0';
-			datelen = 0;
-		}
-
-#ifdef THUMB_SUPPORT
-		if (format != PIMA15740_FMT_A_TEXT) {
-			thumb_size = generate_thumb(dentry->d_name);
-			if (thumb_size < 0) {
-				thumb_size = 0;
-				continue;
-			}
-		}
-#endif
-
-		/* namelen and datelen include terminating '\0', plus 4 string-size bytes */
-		osize = sizeof(*obj) + 2 * (datelen + namelen) + 4;
-
-		if (verbose)
-			fprintf(stderr, "Listing image %s, modified %s, info-size %u\n",
-				dentry->d_name, mod, (unsigned int)osize);
-
-		obj = malloc(osize);
-		if (!obj) {
-			ret = -1;
-			break;
-		}
+	/* String length including the trailing '\0' */
+	datelen = strlen(mod) + 1;
+	ret = put_string(ic, mod_ucs2, mod, datelen);
+	if (ret) {
+		mod[0] = '\0';
+		datelen = 0;
+	}
 
 #ifdef THUMB_SUPPORT
-		if (format == PIMA15740_FMT_A_TEXT ||
-		    format == PIMA15740_FMT_A_UNDEFINED) {
-			thumb_format = PIMA15740_FMT_A_UNDEFINED;
-			thumb_width = 0;
-			thumb_height = 0;
+	if (format != PIMA15740_FMT_A_TEXT) {
+		thumb_size = generate_thumb(filename);
+		if (thumb_size < 0) {
 			thumb_size = 0;
-		} else {
-			thumb_format = PIMA15740_FMT_I_JFIF;
-			thumb_width = THUMB_WIDTH;
-			thumb_height = THUMB_HEIGHT;
+			return 0;
 		}
-#else
+	}
+#endif
+
+	/* namelen and datelen include terminating '\0', plus 4 string-size bytes */
+	osize = sizeof(*obj) + 2 * (datelen + namelen) + 4;
+
+	if (verbose)
+		fprintf(stderr, "Listing image %s, modified %s, info-size %u\n",
+				filename, mod, (unsigned int) osize);
+
+	obj = malloc(osize);
+	if (!obj) {
+		return -1;
+	}
+
+#ifdef THUMB_SUPPORT
+	if (format == PIMA15740_FMT_A_TEXT ||
+			format == PIMA15740_FMT_A_UNDEFINED) {
 		thumb_format = PIMA15740_FMT_A_UNDEFINED;
 		thumb_width = 0;
 		thumb_height = 0;
 		thumb_size = 0;
+	} else {
+		thumb_format = PIMA15740_FMT_I_JFIF;
+		thumb_width = THUMB_WIDTH;
+		thumb_height = THUMB_HEIGHT;
+	}
+#else
+	thumb_format = PIMA15740_FMT_A_UNDEFINED;
+	thumb_width = 0;
+	thumb_height = 0;
+	thumb_size = 0;
 #endif
 
-		obj->handle = ++handle;
+	++last_object_number;
+	obj->handle = last_object_number;
 
-		/* Fixed size object info, filename, capture date, and two empty strings */
-		obj->info_size = sizeof(obj->info) + 2 * (datelen + namelen) + 4;
+	/* Fixed size object info, filename, capture date, and two empty strings */
+	obj->info_size = sizeof(obj->info) + 2 * (datelen + namelen) + 4;
 
-		obj->info.storage_id			= __cpu_to_le32(STORE_ID);
-		obj->info.object_format			= __cpu_to_le16(format);
-		obj->info.protection_status		= __cpu_to_le16(fstat.st_mode & S_IWUSR ? 0 : 1);
-		obj->info.object_compressed_size	= __cpu_to_le32(fstat.st_size);
-		obj->info.thumb_format			= __cpu_to_le16(thumb_format);
-		obj->info.thumb_compressed_size		= __cpu_to_le32(thumb_size);
-		obj->info.thumb_pix_width		= __cpu_to_le32(thumb_width);
-		obj->info.thumb_pix_height		= __cpu_to_le32(thumb_height);
-		obj->info.image_pix_width		= __cpu_to_le32(0);	/* 0 == */
-		obj->info.image_pix_height		= __cpu_to_le32(0);	/* not */
-		obj->info.image_bit_depth		= __cpu_to_le32(0);	/* supported */
-		obj->info.parent_object			= __cpu_to_le32(2);	/* Fixed /dcim/xxx/ */
-		obj->info.association_type		= __cpu_to_le16(0);
-		obj->info.association_desc		= __cpu_to_le32(0);
-		obj->info.sequence_number		= __cpu_to_le32(0);
-		strncpy(obj->name, dentry->d_name, sizeof(obj->name));
+	if(verbose)
+		fprintf(stderr, "adding %s with size %d\n", filename, (int) fstat.st_size);
 
-		obj->info.strings[0]					= namelen;
-		memcpy(obj->info.strings + 1, fname_ucs2, namelen * 2);
-		/* We use file modification date as Capture Date */
-		obj->info.strings[1 + namelen * 2]			= datelen;
-		memcpy(obj->info.strings + 2 + namelen * 2, mod_ucs2, datelen * 2);
-		/* Empty Modification Date */
-		obj->info.strings[2 + (namelen + datelen) * 2]	= 0;
-		/* Empty Keywords */
-		obj->info.strings[3 + (namelen + datelen) * 2]	= 0;
+	obj->info.storage_id = __cpu_to_le32(STORE_ID);
+	obj->info.object_format = __cpu_to_le16(format);
+	obj->info.protection_status
+			= __cpu_to_le16(fstat.st_mode & S_IWUSR ? 0 : 1);
+	obj->info.object_compressed_size = __cpu_to_le32(fstat.st_size);
+	obj->info.thumb_format = __cpu_to_le16(thumb_format);
+	obj->info.thumb_compressed_size = __cpu_to_le32(thumb_size);
+	obj->info.thumb_pix_width = __cpu_to_le32(thumb_width);
+	obj->info.thumb_pix_height = __cpu_to_le32(thumb_height);
+	obj->info.image_pix_width = __cpu_to_le32(0); /* 0 == */
+	obj->info.image_pix_height = __cpu_to_le32(0); /* not */
+	obj->info.image_bit_depth = __cpu_to_le32(0); /* supported */
+	obj->info.parent_object = __cpu_to_le32(2); /* Fixed /dcim/xxx/ */
+	obj->info.association_type = __cpu_to_le16(0);
+	obj->info.association_desc = __cpu_to_le32(0);
+	obj->info.sequence_number = __cpu_to_le32(0);
+	strncpy(obj->name, filename, sizeof(obj->name));
 
-		images = g_slist_append(images, obj);
+	obj->info.strings[0] = namelen;
+	memcpy(obj->info.strings + 1, fname_ucs2, namelen * 2);
+	/* We use file modification date as Capture Date */
+	obj->info.strings[1 + namelen * 2] = datelen;
+	memcpy(obj->info.strings + 2 + namelen * 2, mod_ucs2, datelen * 2);
+	/* Empty Modification Date */
+	obj->info.strings[2 + (namelen + datelen) * 2] = 0;
+	/* Empty Keywords */
+	obj->info.strings[3 + (namelen + datelen) * 2] = 0;
+
+	images = g_slist_append(images, obj);
+
+	return 0;
+}
+
+static int enum_objects(const char *path) {
+	DIR *d;
+	struct dirent *dentry;
+	int ret;
+
+	ret = chdir(path);
+	if (ret < 0)
+		return ret;
+
+	d = opendir(".");
+
+	/* First two handles used for /DCIM/PTP_MODEL_DIR */
+	last_object_number = 2;
+
+	while ((dentry = readdir(d))) {
+		ret = add_object(dentry->d_name);
+		if (ret < 0)
+			break;
 	}
-
-	object_number = handle;
-	last_object_number = handle;
 
 	closedir(d);
 	return ret;
@@ -2643,6 +2879,7 @@ int main(int argc, char *argv[])
 	int c, ret;
 	struct stat root_stat;
 	images = NULL;
+	int notify_wd;
 
 	puts("Linux PTP Gadget v" VERSION_STRING);
 
@@ -2693,7 +2930,9 @@ int main(int argc, char *argv[])
 	 */
 	update_free_space();
 
+	sem_init(&dbaccess, 0, 0);
 	enum_objects(root);
+	sem_post(&dbaccess);
 
 	if (chdir("/dev/ptp") < 0) {
 		perror("can't chdir /dev/ptp");
@@ -2706,6 +2945,18 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	if ((notify_fd = inotify_init()) < 0)
+		perror("inotify init failed");
+
+	if ((notify_wd = inotify_add_watch(notify_fd, root, IN_CLOSE_WRITE | IN_DELETE)) < 0)
+		perror("inotify add watch failed");
+
+	ret = pthread_create(&inotify_pthread, NULL, inotify_thread, NULL);
+	if (ret < 0) {
+		perror("can't create inotify thread");
+		exit(EXIT_FAILURE);
+	}
+
 	init_device();
 	if (control < 0)
 		exit(EXIT_FAILURE);
@@ -2713,6 +2964,9 @@ int main(int argc, char *argv[])
 	fflush(stderr);
 
 	ret = main_loop();
+
+	inotify_rm_watch(notify_fd, notify_wd);
+	close(notify_fd);
 
 	iconv_close(uc);
 	iconv_close(ic);
