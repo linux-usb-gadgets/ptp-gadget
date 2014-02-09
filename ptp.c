@@ -67,6 +67,9 @@ static int verbose;
 #define PTP_STORAGE_DESC	"SD/MMC"
 #define PTP_MODEL_DIR		"100LINUX"
 
+#define THUMB_SUPPORT
+#undef THUMB_SUPPORT
+
 /*-------------------------------------------------------------------------*/
 
 /* USB subclass value = the protocol encapsulation */
@@ -210,7 +213,6 @@ static const struct
 	}							\
 } while (0)
 
-#define THUMB_LOCATION		"/var/cache/ptp/thumb/"
 #define STORE_ID		0x00010001
 
 #define PTP_PARAM_UNUSED	0
@@ -466,9 +468,12 @@ static pthread_t bulk_pthread;
 #define __stringify(x)		__stringify_1(x)
 
 #define BUF_SIZE	4096
+#ifdef THUMB_SUPPORT
 #define THUMB_WIDTH	160
 #define THUMB_HEIGHT	120
 #define THUMB_SIZE	__stringify(THUMB_WIDTH) "x" __stringify(THUMB_HEIGHT)
+#define THUMB_LOCATION    "/var/cache/ptp/thumb/"
+#endif
 
 struct ptp_object_info {
 	uint32_t	storage_id;
@@ -866,6 +871,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	s_container->type = __cpu_to_le16(PTP_CONTAINER_TYPE_DATA_BLOCK);
 	offset = sizeof(*s_container);
 
+#ifdef THUMB_SUPPORT
 	if (!thumb) {
 		strncpy(name, obj->name, sizeof(name) - 1);
 		name[sizeof(name) - 1] = '\0';
@@ -880,6 +886,13 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 		ret = chdir(THUMB_LOCATION);
 		file_size = __le32_to_cpu(obj->info.thumb_compressed_size);
 	}
+#else
+	(void)thumb;
+	strncpy(name, obj->name, sizeof(name) - 1);
+	name[sizeof(name) - 1] = '\0';
+	ret = chdir(root);
+	file_size = __le32_to_cpu(obj->info.object_compressed_size);
+#endif
 
 	total = file_size + sizeof(*s_container);
 	if (verbose)
@@ -1099,6 +1112,7 @@ static void dump_obj(const char *s)
 
 static void delete_thumb(struct obj_list *obj)
 {
+#ifdef THUMB_SUPPORT
 	char thumb[256];
 	char *dot;
 
@@ -1117,6 +1131,9 @@ static void delete_thumb(struct obj_list *obj)
 	if (unlink(thumb))
 		fprintf(stderr, "Cannot delete %s: %s\n",
 			thumb, strerror(errno));
+#else
+	(void)obj;
+#endif
 }
 
 static enum pima15740_response_code delete_file(const char *name)
@@ -1521,7 +1538,9 @@ err:
 	return -1;
 }
 
+#ifdef THUMB_SUPPORT
 static int generate_thumb(const char *);
+#endif
 static int process_send_object(void *recv_buf, void *send_buf)
 {
 	struct ptp_container *r_container = (struct ptp_container *)recv_buf;
@@ -1639,6 +1658,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 	munmap(map, obj_size);
 	close(fd);
 
+#ifdef THUMB_SUPPORT
 	if (oi->info.object_format != PIMA15740_FMT_A_UNDEFINED &&
 	    oi->info.object_format != PIMA15740_FMT_A_TEXT) {
 		ret = generate_thumb(object_info_p->name);
@@ -1649,6 +1669,7 @@ static int process_send_object(void *recv_buf, void *send_buf)
 			oi->info.thumb_pix_height = __cpu_to_le32(THUMB_HEIGHT);
 		}
 	}
+#endif
 
 link:
 	object_info_p->next = 0;
@@ -2499,6 +2520,7 @@ static int enum_objects(const char *path)
 			datelen = 0;
 		}
 
+#ifdef THUMB_SUPPORT
 		if (format != PIMA15740_FMT_A_TEXT) {
 			thumb_size = generate_thumb(dentry->d_name);
 			if (thumb_size < 0) {
@@ -2506,6 +2528,7 @@ static int enum_objects(const char *path)
 				continue;
 			}
 		}
+#endif
 
 		/* namelen and datelen include terminating '\0', plus 4 string-size bytes */
 		osize = sizeof(*obj) + 2 * (datelen + namelen) + 4;
@@ -2520,6 +2543,7 @@ static int enum_objects(const char *path)
 			break;
 		}
 
+#ifdef THUMB_SUPPORT
 		if (format == PIMA15740_FMT_A_TEXT ||
 		    format == PIMA15740_FMT_A_UNDEFINED) {
 			thumb_format = PIMA15740_FMT_A_UNDEFINED;
@@ -2531,6 +2555,12 @@ static int enum_objects(const char *path)
 			thumb_width = THUMB_WIDTH;
 			thumb_height = THUMB_HEIGHT;
 		}
+#else
+		thumb_format = PIMA15740_FMT_A_UNDEFINED;
+		thumb_width = 0;
+		thumb_height = 0;
+		thumb_size = 0;
+#endif
 
 		obj->handle = ++handle;
 
@@ -2687,6 +2717,7 @@ int main(int argc, char *argv[])
 	exit(ret ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
+#ifdef THUMB_SUPPORT
 static int generate_thumb(const char *file_name)
 {
 	struct stat fstat, tstat;
@@ -2734,3 +2765,4 @@ static int generate_thumb(const char *file_name)
 	}
 	return tstat.st_size;
 }
+#endif
