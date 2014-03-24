@@ -1426,11 +1426,9 @@ const char *oid[] =
 	"ModificationDate      ",
 	"Keywords              ",
 };
-#endif
 
 static void dump_object_info(const struct ptp_object_info *i)
 {
-#ifdef DEBUG
 	char buf[256];
 	int idx;
 
@@ -1462,12 +1460,11 @@ static void dump_object_info(const struct ptp_object_info *i)
 			oid[16], buf, i->strings[idx]);
 	}
 	fprintf(stdout, "-------------------------------\n");
-#endif
 }
 
+#ifdef DEBUG
 static void dump_obj(const char *s)
 {
-#ifdef DEBUG
 	struct obj_list *obj = images;
 
 	printf("%s, object_number %d\n", s, object_number);
@@ -1476,8 +1473,8 @@ static void dump_obj(const char *s)
 		printf("obj: 0x%p, next 0x%p, handle %u, name %s\n",
 			obj, obj->next, obj->handle, obj->name);
 	printf("\n");
-#endif
 }
+#endif
 
 static void delete_thumb(struct obj_list *obj)
 {
@@ -1734,7 +1731,9 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	}
 
 	info = (struct ptp_object_info *)r_container->payload;
+#ifdef DEBUG
 	dump_object_info(info);
+#endif
 
 	switch (info->object_format) {
 	case PIMA15740_FMT_A_UNDEFINED:
@@ -2071,7 +2070,9 @@ link:
 
 	object_number++;
 	object_info_p = 0;
+#ifdef DEBUG
 	dump_obj("after link");
+#endif
 
 	ret = update_free_space();
 	if (ret < 0)
