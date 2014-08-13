@@ -1293,7 +1293,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	p2 = __le32_to_cpu(*(param + 1));
 
 	if (verbose) {
-		fprintf(stderr, "store_id 0x%lx, parent handle 0x%lx\n",
+		fprintf(stderr, "store_id 0x%llx, parent handle 0x%llx\n",
 			(unsigned long)p1, (unsigned long)p2);
 	}
 
