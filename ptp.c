@@ -1060,7 +1060,6 @@ static void dump_object_info(const struct ptp_object_info *i)
 	fprintf(stdout, "-------------------------------\n");
 }
 
-#ifdef DEBUG
 static void dump_obj(const char *s)
 {
 	struct obj_list *obj;
