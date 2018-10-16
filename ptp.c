@@ -37,8 +37,22 @@
 #include <linux/usb/functionfs.h>
 #include <linux/usb/ch9.h>
 
-#define cpu_to_le16(x)	htole16(x)
-#define cpu_to_le32(x)	htole32(x)
+/*
++ * cpu_to_le16/32 are used when initializing structures, a context where a
++ * function call is not allowed. To solve this, we code cpu_to_le16/32 in a way
++ * that allows them to be used when initializing structures.
++ */
+
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+#define cpu_to_le16(x)  (x)
+#define cpu_to_le32(x)  (x)
+#else
+#define cpu_to_le16(x)  ((((x) >> 8) & 0xffu) | (((x) & 0xffu) << 8))
+#define cpu_to_le32(x)  \
+	((((x) & 0xff000000u) >> 24) | (((x) & 0x00ff0000u) >>  8) | \
+	(((x) & 0x0000ff00u) <<  8) | (((x) & 0x000000ffu) << 24))
+#endif
+
 #define le32_to_cpu(x)	le32toh(x)
 #define le16_to_cpu(x)	le16toh(x)
 
@@ -91,7 +105,9 @@ static int verbose;
 
 static const struct
 {
-	struct usb_functionfs_descs_head header;
+	struct usb_functionfs_descs_head_v2 header;
+	__le32 fs_count;
+	__le32 hs_count;
 	struct {
 		struct usb_interface_descriptor intf;
 		struct usb_endpoint_descriptor_no_audio source;
@@ -100,12 +116,14 @@ static const struct
 	} __attribute__((packed)) fs_descs, hs_descs;
 } __attribute__((packed)) descriptors = {
 	.header = {
-		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC),
-		.length = cpu_to_le32(sizeof(descriptors)),
-		.fs_count = 4,
-		.hs_count = 4,
-	}, .fs_descs = {
-		.intf = {
+		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
+		.flags = cpu_to_le32(FUNCTIONFS_HAS_FS_DESC |
+				     FUNCTIONFS_HAS_HS_DESC),
+		.length = cpu_to_le32(sizeof descriptors),
+	},
+	.fs_count = cpu_to_le32(4),
+	.fs_descs = {
+		.intf =	{
 			.bLength		= sizeof(descriptors.fs_descs.intf),
 			.bDescriptorType	= USB_DT_INTERFACE,
 			.bNumEndpoints		= 3,
@@ -131,7 +149,9 @@ static const struct
 			.wMaxPacketSize		= __constant_cpu_to_le16(STATUS_MAXPACKET),
 			.bInterval		= 10,
 		},
-	}, .hs_descs = {
+	},
+	.hs_count = cpu_to_le32(4),
+	.hs_descs = {
 		.intf = {
 			.bLength		= sizeof(descriptors.hs_descs.intf),
 			.bDescriptorType	= USB_DT_INTERFACE,
@@ -819,6 +839,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	int fd = -1;
 	char name[256];
 	unsigned char xferbuf[8*1024];
+	size_t unused __attribute__((unused));
 
 	param = (uint32_t *)r_container->payload;
 	handle = __le32_to_cpu(*param);
@@ -862,7 +883,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 
 	total = file_size + sizeof(*s_container);
 	if (verbose)
-		fprintf(stderr, "%s(): total %u\n", __func__, total);
+		fprintf(stderr, "%s(): total %lu\n", __func__, total);
 	s_container->length = __cpu_to_le32(total);
 
 	if (!ret)
@@ -874,7 +895,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	}
 
 	count = min(total, send_len);
-	read(fd, send_buf + offset, count - offset);
+	unused = read(fd, send_buf + offset, count - offset);
 	ret = bulk_write(send_buf, count);
 	if (ret < 0) {
 		errno = EPIPE;
@@ -885,7 +906,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 
 	while (total) {
 		count = min(total, send_len);
-		read(fd, xferbuf, count);
+		unused = read(fd, xferbuf, count);
 		ret = bulk_write(xferbuf, count);
 		if (ret < 0) {
 			errno = EPIPE;
@@ -949,7 +970,7 @@ static int send_storage_info(void *recv_buf, void *send_buf, size_t send_len)
 	store_id = __le32_to_cpu(*param);
 
 	if (verbose)
-		fprintf(stderr, "%u bytes storage info\n", sizeof(storage_info));
+		fprintf(stderr, "%lu bytes storage info\n", sizeof(storage_info));
 
 	if (store_id != STORE_ID) {
 		make_response(s_container, r_container,
@@ -965,7 +986,7 @@ static int send_storage_info(void *recv_buf, void *send_buf, size_t send_len)
 	}
 
 	if (verbose > 1)
-		fprintf(stderr, "Block-size %d, total 0x%llx, free 0x%llx\n",
+		fprintf(stderr, "Block-size %ld, total 0x%lx, free 0x%lx\n",
 			fs.f_bsize, fs.f_blocks, fs.f_bfree);
 
 	count = sizeof(storage_info) + sizeof(*s_container);
@@ -1146,7 +1167,7 @@ static int update_free_space(void)
 	}
 
 	if (verbose > 1)
-		fprintf(stdout, "Block-size %d, total %d, free %d\n",
+		fprintf(stdout, "Block-size %ld, total %d, free %d\n",
 			fs.f_bsize, (int)fs.f_blocks, (int)fs.f_bfree);
 
 	bytes = (unsigned long long)fs.f_bsize * fs.f_bfree;
@@ -1282,7 +1303,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	p2 = __le32_to_cpu(*(param + 1));
 
 	if (verbose) {
-		fprintf(stderr, "store_id 0x%llx, parent handle 0x%llx\n",
+		fprintf(stderr, "store_id 0x%lx, parent handle 0x%lx\n",
 			(unsigned long)p1, (unsigned long)p2);
 	}
 
@@ -1332,7 +1353,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 	    __le64_to_cpu(storage_info.free_space_in_bytes)) {
 		code = PIMA15740_RESP_STORE_FULL;
 		if (verbose) {
-			fprintf(stdout, "no space: free %lld, req. %d\n",
+			fprintf(stdout, "no space: free %ld, req. %d\n",
 				storage_info.free_space_in_bytes,
 				info->object_compressed_size);
 		}
@@ -1702,7 +1723,7 @@ static int process_one_request(void *recv_buf, size_t *recv_size, void *send_buf
 			CHECK_COUNT(count, 12, 12, "GET_DEVICE_INFO");
 
 			if (verbose)
-				fprintf(stderr, "%u bytes device info\n", sizeof(dev_info));
+				fprintf(stderr, "%lu bytes device info\n", sizeof(dev_info));
 			count = sizeof(dev_info) + sizeof(*s_container);
 
 			/* First part: data block */
