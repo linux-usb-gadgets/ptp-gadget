@@ -975,7 +975,7 @@ static int send_storage_info(void *recv_buf, void *send_buf, size_t send_len)
 	}
 
 	if (verbose > 1)
-		fprintf(stderr, "Block-size %d, total 0x%lx, free 0x%lx\n",
+		fprintf(stderr, "Block-size %d, total 0x%llx, free 0x%llx\n",
 			fs.f_bsize, fs.f_blocks, fs.f_bfree);
 
 	count = sizeof(storage_info) + sizeof(*s_container);
