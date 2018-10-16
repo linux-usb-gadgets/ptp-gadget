@@ -95,6 +95,7 @@ static int verbose;
 #define USB_PR_CB		0x01		/* Control/Bulk w/o interrupt */
 
 #define MAX_PACKET_SIZE_HS 512
+#define MAX_PACKET_SIZE_SS 1024
 
 /* some devices can handle other status packet sizes */
 
@@ -108,17 +109,28 @@ static const struct
 	struct usb_functionfs_descs_head_v2 header;
 	__le32 fs_count;
 	__le32 hs_count;
+	__le32 ss_count;
 	struct {
 		struct usb_interface_descriptor intf;
 		struct usb_endpoint_descriptor_no_audio source;
 		struct usb_endpoint_descriptor_no_audio sink;
 		struct usb_endpoint_descriptor_no_audio status;
 	} __attribute__((packed)) fs_descs, hs_descs;
+	struct {
+		struct usb_interface_descriptor intf;
+		struct usb_endpoint_descriptor_no_audio source;
+		struct usb_ss_ep_comp_descriptor source_comp;
+		struct usb_endpoint_descriptor_no_audio sink;
+		struct usb_ss_ep_comp_descriptor sink_comp;
+		struct usb_endpoint_descriptor_no_audio status;
+		struct usb_ss_ep_comp_descriptor status_comp;
+	} ss_descs;
 } __attribute__((packed)) descriptors = {
 	.header = {
 		.magic = cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
 		.flags = cpu_to_le32(FUNCTIONFS_HAS_FS_DESC |
-				     FUNCTIONFS_HAS_HS_DESC),
+				     FUNCTIONFS_HAS_HS_DESC |
+				     FUNCTIONFS_HAS_SS_DESC),
 		.length = cpu_to_le32(sizeof descriptors),
 	},
 	.fs_count = cpu_to_le32(4),
@@ -179,6 +191,63 @@ static const struct
 			.bmAttributes		= USB_ENDPOINT_XFER_INT,
 			.wMaxPacketSize		= __constant_cpu_to_le16(STATUS_MAXPACKET),
 			.bInterval		= 10,
+		},
+	},
+	.ss_count = cpu_to_le32(7),
+	.ss_descs = {
+		.intf = {
+			.bLength		= sizeof descriptors.ss_descs.intf,
+			.bDescriptorType	= USB_DT_INTERFACE,
+			.bNumEndpoints		= 3,
+			.bInterfaceClass	= USB_CLASS_STILL_IMAGE,
+			.bInterfaceSubClass	= USB_SC_IMAGE_CAPTURE,
+			.bInterfaceProtocol	= USB_PR_CB,
+			.iInterface		= 1,
+		},
+		.source =	{
+			.bLength		= sizeof descriptors.ss_descs.source,
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 1 | USB_DIR_IN,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+			.wMaxPacketSize		= __constant_cpu_to_le16(MAX_PACKET_SIZE_SS),
+		},
+		.source_comp = {
+			.bLength = USB_DT_SS_EP_COMP_SIZE,
+			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
+			.bMaxBurst = 0,
+			.bmAttributes = 0,
+			.wBytesPerInterval = 0,
+		},
+		.sink =	{
+			.bLength		= sizeof descriptors.ss_descs.sink,
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 2 | USB_DIR_OUT,
+			.bmAttributes		= USB_ENDPOINT_XFER_BULK,
+			.wMaxPacketSize		= __constant_cpu_to_le16(MAX_PACKET_SIZE_SS),
+		},
+		.sink_comp = {
+			.bLength = USB_DT_SS_EP_COMP_SIZE,
+			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
+			.bMaxBurst = 0,
+			.bmAttributes = 0,
+			.wBytesPerInterval = 0,
+		},
+		.status =
+		{
+			.bLength		= sizeof descriptors.ss_descs.status,
+			.bDescriptorType	= USB_DT_ENDPOINT,
+			.bEndpointAddress	= 3 | USB_DIR_IN,
+			.bmAttributes		= USB_ENDPOINT_XFER_INT,
+			/* .wMaxPacketSize		= autoconfiguration (kernel) */
+			.wMaxPacketSize		= __constant_cpu_to_le16(STATUS_MAXPACKET),
+			.bInterval		= 10,
+		},
+		.status_comp = {
+			.bLength = USB_DT_SS_EP_COMP_SIZE,
+			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
+			.bMaxBurst = 0,
+			.bmAttributes = 0,
+			.wBytesPerInterval = 0,
 		},
 	},
 };
