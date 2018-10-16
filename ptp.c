@@ -816,9 +816,9 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 	int ret;
 	uint32_t handle;
 	size_t count, total, offset, file_size;
-	void *data, *map;
 	int fd = -1;
 	char name[256];
+	unsigned char xferbuf[8*1024];
 
 	param = (uint32_t *)r_container->payload;
 	handle = __le32_to_cpu(*param);
@@ -862,7 +862,7 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 
 	total = file_size + sizeof(*s_container);
 	if (verbose)
-		fprintf(stderr, "%s(): total %d\n", __func__, total);
+		fprintf(stderr, "%s(): total %u\n", __func__, total);
 	s_container->length = __cpu_to_le32(total);
 
 	if (!ret)
@@ -873,39 +873,29 @@ static int send_object_or_thumb(void *recv_buf, void *send_buf, size_t send_len,
 		return 0;
 	}
 
-	map = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-	if (map == MAP_FAILED) {
-		close(fd);
-		make_response(s_container, r_container, PIMA15740_RESP_INCOMPLETE_TRANSFER,
-			      sizeof(*s_container));
-		return 0;
-	}
-
 	count = min(total, send_len);
-	memcpy(send_buf + offset, map, count - offset);
+	read(fd, send_buf + offset, count - offset);
 	ret = bulk_write(send_buf, count);
 	if (ret < 0) {
 		errno = EPIPE;
 		goto out;
 	}
 	total -= count;
-	data = map + count - offset;
-	send_len = 8 * 1024;
+	send_len = min((size_t)(8 * 1024), sizeof(xferbuf));
 
 	while (total) {
 		count = min(total, send_len);
-		ret = bulk_write(data, count);
+		read(fd, xferbuf, count);
+		ret = bulk_write(xferbuf, count);
 		if (ret < 0) {
 			errno = EPIPE;
 			goto out;
 		}
 		total -= count;
-		data += count;
 	}
 	ret = 0;
 
 out:
-	munmap(map, file_size);
 	close(fd);
 
 	if (!ret)
