@@ -1376,7 +1376,7 @@ static int process_send_object_info(void *recv_buf, void *send_buf)
 			(unsigned long)p1, (unsigned long)p2);
 	}
 
-	/* Read ObjectInfo comming in the data phase */
+	/* Read ObjectInfo coming in the data phase */
 	ret = read_container(recv_buf, BUF_SIZE);
 	if (ret < 0) {
 		code = PIMA15740_RESP_INCOMPLETE_TRANSFER;
