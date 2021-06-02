@@ -20,7 +20,7 @@ writable by the ptp-gadget user.
 
 The program takes one compulsory parameter - the path to the directory, in which
 images are stored. Optionally, "-v" switches can be used to increment verbosity
-level of the program.
+level of the program and "-l dir" can override the lock dir from /tmp to dir.
 
 Known problems: not yet working with MS Windows Vista.
 
