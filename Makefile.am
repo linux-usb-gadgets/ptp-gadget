@@ -7,9 +7,6 @@ AM_CPPFLAGS = \
 	$(GLIB_CFLAGS) \
 	-pthread
 
-EXTRA_DIST = \
-	autogen.sh
-
 MAINTAINERCLEANFILES = \
 	configure \
 	aclocal.m4 \
